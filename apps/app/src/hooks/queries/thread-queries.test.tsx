@@ -24,6 +24,7 @@ import {
   useThreadDetailBootstrap,
   useThreadHostFilePreview,
   useThreadQueuedMessages,
+  useThreadTimeline,
 } from "./thread-queries";
 
 vi.mock("@/lib/api", async (importOriginal) => {
@@ -81,6 +82,27 @@ const THREAD_WITH_INCLUDES = {
   host: null,
 } satisfies ThreadWithIncludesResponse;
 
+function makeTimelineResponse(maxSeq = 0): ThreadTimelineResponse {
+  return {
+    activeBackgroundCommands: [],
+    activePromptMode: null,
+    activeThinking: null,
+    activeWorkflows: [],
+    goal: null,
+    maxSeq,
+    modelFallback: null,
+    pendingTodos: null,
+    rows: [],
+    timelinePage: {
+      hasOlderRows: false,
+      kind: "latest",
+      olderCursor: null,
+      returnedSegmentCount: 0,
+      segmentLimit: 8,
+    },
+  };
+}
+
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
@@ -90,24 +112,7 @@ beforeEach(() => {
   vi.mocked(sdk.threads.get).mockResolvedValue(THREAD_WITH_INCLUDES);
   vi.mocked(sdk.threads.list).mockResolvedValue([]);
   vi.mocked(sdk.threads.queuedMessages.list).mockResolvedValue([]);
-  vi.mocked(sdk.threads.timeline).mockResolvedValue({
-    rows: [],
-    activePromptMode: null,
-    activeThinking: null,
-    activeWorkflows: [],
-    activeBackgroundCommands: [],
-    pendingTodos: null,
-    goal: null,
-    modelFallback: null,
-    timelinePage: {
-      kind: "latest",
-      segmentLimit: 100,
-      returnedSegmentCount: 0,
-      hasOlderRows: false,
-      olderCursor: null,
-    },
-    maxSeq: 0,
-  } satisfies ThreadTimelineResponse);
+  vi.mocked(sdk.threads.timeline).mockResolvedValue(makeTimelineResponse());
   vi.mocked(api.getThreadHostFilePreview).mockResolvedValue({
     kind: "text",
     path: "/tmp/log.txt",
@@ -175,7 +180,7 @@ describe("useThreadDetailBootstrap", () => {
       modelFallback: null,
       timelinePage: {
         kind: "latest",
-        segmentLimit: 100,
+        segmentLimit: 8,
         returnedSegmentCount: 1,
         hasOlderRows: false,
         olderCursor: null,
@@ -206,6 +211,7 @@ describe("useThreadDetailBootstrap", () => {
     await waitFor(() => {
       expect(sdk.threads.timeline).toHaveBeenCalledWith({
         afterSequence: "7",
+        segmentLimit: "8",
         signal: expect.any(AbortSignal),
         threadId: "thread-1",
       });
@@ -378,6 +384,61 @@ describe("useThreadQueuedMessages", () => {
         refetchOnWindowFocus: true,
       }),
     );
+  });
+});
+
+describe("useThreadTimeline", () => {
+  it("bounds the initial app timeline window", async () => {
+    const { wrapper } = createQueryClientTestHarness();
+
+    renderHook(() => useThreadTimeline("thread-1"), { wrapper });
+
+    await waitFor(() => {
+      expect(sdk.threads.timeline).toHaveBeenCalledTimes(1);
+    });
+    expect(vi.mocked(sdk.threads.timeline).mock.calls[0]?.[0]).toEqual({
+      segmentLimit: "8",
+      signal: expect.any(AbortSignal),
+      threadId: "thread-1",
+    });
+  });
+
+  it("keeps the app window bound when a stale delta needs a full fetch", async () => {
+    const previous = makeTimelineResponse(5);
+    const staleDelta = {
+      ...makeTimelineResponse(6),
+      delta: { rowOrder: ["missing-row"], upsertRows: [] },
+    };
+    vi.mocked(sdk.threads.timeline)
+      .mockResolvedValueOnce(staleDelta)
+      .mockResolvedValueOnce(makeTimelineResponse(6));
+    const { queryClient, wrapper } = createQueryClientTestHarness();
+    queryClient.setQueryData(threadTimelineQueryKey("thread-1"), previous, {
+      updatedAt: 1,
+    });
+
+    renderHook(() => useThreadTimeline("thread-1"), { wrapper });
+
+    await waitFor(() => {
+      expect(sdk.threads.timeline).toHaveBeenCalledTimes(2);
+    });
+    expect(vi.mocked(sdk.threads.timeline).mock.calls).toEqual([
+      [
+        {
+          afterSequence: "5",
+          segmentLimit: "8",
+          signal: expect.any(AbortSignal),
+          threadId: "thread-1",
+        },
+      ],
+      [
+        {
+          segmentLimit: "8",
+          signal: expect.any(AbortSignal),
+          threadId: "thread-1",
+        },
+      ],
+    ]);
   });
 });
 
