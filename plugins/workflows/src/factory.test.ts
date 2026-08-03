@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createRun, getRun, migrations } from "./data.js";
+import { createRun, getRun, migrations, settleRun } from "./data.js";
 import {
   BUILT_IN_FACTORY_WORKFLOW_SOURCE,
   createFactoryService,
@@ -15,6 +15,7 @@ function workflowStub(db: Database.Database): WorkflowService {
     start: vi.fn(async (input) => {
       expect(input.source).toBe(BUILT_IN_FACTORY_WORKFLOW_SOURCE);
       return createRun(db, {
+        factoryId: input.factoryId,
         projectId: input.projectId,
         originThreadId: input.originThreadId,
         environmentId: "environment-1",
@@ -141,7 +142,43 @@ describe("Factory lifecycle service", () => {
     expect(outputs).toEqual([]);
   });
 
-  it("requires a frozen brief and explicit approval before launching", async () => {
+  it("returns a rejected candidate as a product result, not a runtime failure", async () => {
+    const parsed = parseWorkflowSource(BUILT_IN_FACTORY_WORKFLOW_SOURCE);
+    const rejected = {
+      approved: false,
+      summary: "Still missing the empty state",
+      blocking: ["Add the empty state"],
+      evidence: ["Inspected src/app.ts"],
+    };
+    const outputs: JsonValue[] = [
+      { summary: "Plan", steps: ["Build it"], risks: [] },
+      { summary: "Build", changedFiles: ["src/app.ts"], checks: [] },
+      rejected,
+      { summary: "Revision", changedFiles: ["src/app.ts"], checks: [] },
+      rejected,
+    ];
+
+    await expect(
+      executeWorkflowScript({
+        args: { request: "Improve onboarding", brief },
+        body: parsed.body,
+        capabilities: {
+          agent: async () => outputs.shift() ?? null,
+          log: vi.fn(),
+          phase: vi.fn(),
+        },
+      }),
+    ).resolves.toEqual({
+      build: {
+        summary: "Revision",
+        changedFiles: ["src/app.ts"],
+        checks: [],
+      },
+      acceptance: rejected,
+    });
+  });
+
+  it("requires a frozen brief and the configured approval authority before launching", async () => {
     const workflows = workflowStub(db);
     const factory = createFactoryService(db, workflows);
     const engagement = factory.start({
@@ -150,13 +187,20 @@ describe("Factory lifecycle service", () => {
       request: "Improve onboarding",
     });
 
-    await expect(factory.approve(engagement.id, "thread-1")).rejects.toThrow(
-      /awaiting approval/i,
-    );
+    await expect(
+      factory.approve(engagement.id, "thread-1", "user"),
+    ).rejects.toThrow(/awaiting approval/i);
     expect(workflows.start).not.toHaveBeenCalled();
 
-    factory.propose(engagement.id, "thread-1", brief);
-    const running = await factory.approve(engagement.id, "thread-1");
+    await factory.propose(engagement.id, "thread-1", brief);
+    await expect(
+      factory.approve(engagement.id, "thread-1", "agent"),
+    ).rejects.toThrow(/Light Factory requires user approval/i);
+    const running = await factory.setApprovalMode(
+      engagement.id,
+      "thread-1",
+      "agent",
+    );
     expect(running).toMatchObject({
       status: "running",
       workflowRunId: expect.stringMatching(/^wfr_/),
@@ -168,6 +212,44 @@ describe("Factory lifecycle service", () => {
       source: BUILT_IN_FACTORY_WORKFLOW_SOURCE,
       args: { request: "Improve onboarding", brief },
       resumedFromRunId: null,
+      factoryId: engagement.id,
+    });
+  });
+
+  it("keeps settled success when cancellation loses the completion race", async () => {
+    const workflows = workflowStub(db);
+    const factory = createFactoryService(db, workflows);
+    const engagement = factory.start({
+      projectId: "project-1",
+      originThreadId: "thread-1",
+      request: "Build it",
+    });
+    await factory.propose(engagement.id, "thread-1", brief);
+    const running = await factory.approve(engagement.id, "thread-1", "user");
+    vi.mocked(workflows.stop).mockImplementationOnce(async (runId) => {
+      settleRun(db, {
+        id: runId,
+        status: "succeeded",
+        result: {
+          build: { summary: "Built", changedFiles: [], checks: [] },
+          acceptance: {
+            approved: true,
+            summary: "Accepted",
+            blocking: [],
+            evidence: [],
+          },
+        },
+        error: null,
+      });
+      return false;
+    });
+
+    await expect(
+      factory.cancel(engagement.id, "thread-1"),
+    ).resolves.toMatchObject({
+      id: engagement.id,
+      workflowRunId: running.workflowRunId,
+      status: "candidate",
     });
   });
 
@@ -179,11 +261,11 @@ describe("Factory lifecycle service", () => {
       originThreadId: "thread-1",
       request: "Build it",
     });
-    expect(() => factory.propose(engagement.id, "other-thread", brief)).toThrow(
-      /not available/i,
-    );
-    factory.propose(engagement.id, "thread-1", brief);
-    await factory.approve(engagement.id, "thread-1");
+    await expect(
+      factory.propose(engagement.id, "other-thread", brief),
+    ).rejects.toThrow(/not available/i);
+    await factory.propose(engagement.id, "thread-1", brief);
+    await factory.approve(engagement.id, "thread-1", "user");
     await factory.cancel(engagement.id, "thread-1");
     expect(workflows.stop).toHaveBeenCalledWith(expect.stringMatching(/^wfr_/));
   });

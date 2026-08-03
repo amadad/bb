@@ -39,16 +39,18 @@ installations; enable `workflows` under Extensions → Plugins or run
   bb workflows factory-start --request '<outcome>'
   bb workflows factory-propose <factory-id> --brief '<json>'
   bb workflows factory-status <factory-id>
-  bb workflows factory-approve <factory-id>
   bb workflows factory-stop <factory-id>
   bb workflows factory-close <factory-id>
 
 Select **Factory** from the composer `+` menu to prime a request. The origin
 agent creates a durable shaping engagement, investigates discoverable facts,
-and submits a structured brief. No production workflow starts until the user
-selects **Approve and run** or invokes `factory-approve`. The built-in workflow
-runs Plan, Build, independent Verify, one bounded Revise when needed, and fresh
-Acceptance. It does not commit, push, merge, or deploy.
+and submits a structured brief. Factory starts in **Light** mode, where only
+the user can select **Approve and run**. The user can switch the card to
+**Dark** before approval. In Dark, the agent's frozen proposal also approves
+and launches the workflow. Agents cannot change the mode. The built-in workflow runs Plan, Build, independent
+Verify, one bounded Revise when needed, and fresh Acceptance. Workers are
+instructed not to commit, push, merge, or deploy; the selected permission mode
+and host tools remain the enforcement boundary.
 
 Commands must run from a BB project thread. Workflows has six plugin
 settings, configurable with `bb plugin config workflows set <key> <value>`:

@@ -22,20 +22,26 @@ engagement with `bb_factory_start`. The origin agent investigates discoverable
 facts and asks only blocking owner questions. It then submits a frozen shape
 with `bb_factory_propose`.
 
-The server, not the model, owns the approval transition. No production workflow
-exists until the user selects **Approve and run** in the composer card or uses
-the matching CLI command. Approval launches the built-in provider-independent
+Every Factory starts in **Light** mode. Light requires the user to select
+**Approve and run** in the composer card. The user may switch the card to
+**Dark** before approval. In Dark, the origin agent's frozen proposal is also
+its approval, so the workflow launches immediately. Agents cannot change the
+mode.
+
+Approval launches the built-in provider-independent
 `Plan → Build → Verify → Revise → Acceptance` workflow with the origin thread's
 provider, model, reasoning level, permission mode, environment, and workspace.
-A rejected first review gets one bounded revision and fresh acceptance pass.
-The workflow fails if acceptance still rejects the candidate. It does not
-commit, push, merge, or deploy.
+A rejected first review gets one bounded revision and fresh acceptance pass. A
+second rejection is a valid `rejected` Factory result, not a runtime failure.
+Workers are instructed not to commit, push, merge, or deploy. Factory does not
+grant external-action consent; enforcement remains with the selected BB
+permission mode and host tools.
 
 Factory states are durable:
 
 ```text
 shaping → awaiting_approval → launching → running
-                                      → candidate | failed | cancelled
+                                      → candidate | rejected | failed | cancelled
                                       → closed
 ```
 
@@ -200,7 +206,6 @@ bb workflows stop <run-id>
 bb workflows factory-start --request '<outcome>'
 bb workflows factory-propose <factory-id> --brief '<json>'
 bb workflows factory-status <factory-id>
-bb workflows factory-approve <factory-id>
 bb workflows factory-stop <factory-id>
 bb workflows factory-close <factory-id>
 bb provider list --environment "$BB_ENVIRONMENT_ID" --json

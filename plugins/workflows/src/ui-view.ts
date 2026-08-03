@@ -15,6 +15,8 @@ export function buildFactoryView(factory: FactoryInspection): FactoryView {
     id: factory.id,
     request: factory.request,
     status: factory.status,
+    approvalMode: factory.approvalMode,
+    approvedBy: factory.approvedBy,
     brief: factory.brief,
     workflowRunId: factory.workflowRunId,
     error: factory.error,

@@ -2,7 +2,6 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   attachCallThread,
-  attachFactoryWorkflow,
   cancelFactory,
   cancelRun,
   claimFactoryApproval,
@@ -22,11 +21,11 @@ import {
   queueCallProviderRetry,
   recoverFactoryApprovals,
   recoverInterruptedRuns,
+  setFactoryApprovalMode,
   settleCall,
   settleRun,
   startCall,
   storeStructuredResult,
-  syncFactoryFromWorkflow,
 } from "./data.js";
 
 describe("workflow durable data", () => {
@@ -40,8 +39,9 @@ describe("workflow durable data", () => {
 
   afterEach(() => db.close());
 
-  function newRun() {
+  function newRun(factoryId: string | null = null) {
     return createRun(db, {
+      factoryId,
       projectId: "project-1",
       originThreadId: "thread-1",
       environmentId: "environment-1",
@@ -65,13 +65,17 @@ describe("workflow durable data", () => {
     );
   }
 
-  it("enforces the Factory approval lifecycle and one active engagement per thread", () => {
-    const factory = createFactory(db, {
+  it("enforces Light and Dark approval authority and atomic workflow linkage", () => {
+    const light = createFactory(db, {
       projectId: "project-1",
       originThreadId: "thread-1",
       request: "Make onboarding useful",
     });
-    expect(factory).toMatchObject({ status: "shaping", briefJson: null });
+    expect(light).toMatchObject({
+      status: "shaping",
+      briefJson: null,
+      approvalMode: "user",
+    });
     expect(() =>
       createFactory(db, {
         projectId: "project-1",
@@ -81,35 +85,61 @@ describe("workflow durable data", () => {
     ).toThrow(/active Factory engagement/i);
 
     const brief = JSON.stringify({ outcome: "A usable first-run journey" });
-    expect(proposeFactoryBrief(db, factory.id, brief)).toMatchObject({
-      status: "awaiting_approval",
-      briefJson: brief,
-    });
-    expect(claimFactoryApproval(db, factory.id)).toMatchObject({
+    proposeFactoryBrief(db, light.id, brief);
+    expect(claimFactoryApproval(db, light.id, "agent")).toBeNull();
+    expect(claimFactoryApproval(db, light.id, "user")).toMatchObject({
       status: "launching",
-    });
-    expect(claimFactoryApproval(db, factory.id)).toBeNull();
-
-    const workflow = newRun();
-    expect(attachFactoryWorkflow(db, factory.id, workflow.id)).toMatchObject({
-      status: "running",
-      workflowRunId: workflow.id,
+      approvedBy: "user",
       approvedAt: expect.any(Number),
     });
-    db.prepare(
-      `UPDATE workflow_runs SET status = 'succeeded', result_json = '{}', finished_at = ? WHERE id = ?`,
-    ).run(Date.now(), workflow.id);
-    expect(syncFactoryFromWorkflow(db, factory.id)).toMatchObject({
-      status: "candidate",
+
+    const workflow = newRun(light.id);
+    expect(getFactory(db, light.id)).toMatchObject({
+      status: "running",
+      workflowRunId: workflow.id,
     });
-    expect(closeFactory(db, factory.id)).toMatchObject({
+    expect(() => newRun(light.id)).toThrow(/launch claim/i);
+    expect(
+      db.prepare("SELECT COUNT(*) AS count FROM workflow_runs").get(),
+    ).toEqual({ count: 1 });
+
+    settleRun(db, {
+      id: workflow.id,
+      status: "succeeded",
+      result: {
+        build: { summary: "Built", changedFiles: [], checks: [] },
+        acceptance: {
+          approved: true,
+          summary: "Accepted",
+          blocking: [],
+          evidence: [],
+        },
+      },
+      error: null,
+    });
+    expect(getFactory(db, light.id)).toMatchObject({ status: "candidate" });
+    expect(closeFactory(db, light.id)).toMatchObject({
       status: "closed",
       closedAt: expect.any(Number),
     });
-    expect(getOpenFactoryForThread(db, "thread-1")).toBeNull();
+
+    const dark = createFactory(db, {
+      projectId: "project-1",
+      originThreadId: "thread-1",
+      request: "Build another candidate",
+    });
+    expect(setFactoryApprovalMode(db, dark.id, "agent")).toMatchObject({
+      approvalMode: "agent",
+    });
+    proposeFactoryBrief(db, dark.id, brief);
+    expect(claimFactoryApproval(db, dark.id, "user")).toBeNull();
+    expect(claimFactoryApproval(db, dark.id, "agent")).toMatchObject({
+      status: "launching",
+      approvedBy: "agent",
+    });
   });
 
-  it("recovers interrupted Factory approval and propagates cancellation", () => {
+  it("recovers launch claims and lets workflow settlement own terminal state", () => {
     const factory = createFactory(db, {
       projectId: "project-1",
       originThreadId: "thread-1",
@@ -120,19 +150,40 @@ describe("workflow durable data", () => {
       factory.id,
       JSON.stringify({ outcome: "candidate" }),
     );
-    claimFactoryApproval(db, factory.id);
+    claimFactoryApproval(db, factory.id, "user");
     expect(recoverFactoryApprovals(db)).toBe(1);
     expect(getFactory(db, factory.id)).toMatchObject({
       status: "awaiting_approval",
+      approvedAt: null,
+      approvedBy: null,
     });
 
-    claimFactoryApproval(db, factory.id);
-    const workflow = newRun();
-    attachFactoryWorkflow(db, factory.id, workflow.id);
-    expect(cancelFactory(db, factory.id)).toMatchObject({
-      status: "cancelled",
+    claimFactoryApproval(db, factory.id, "user");
+    const workflow = newRun(factory.id);
+    settleRun(db, {
+      id: workflow.id,
+      status: "succeeded",
+      result: {
+        build: { summary: "Built", changedFiles: [], checks: [] },
+        acceptance: {
+          approved: false,
+          summary: "Rejected",
+          blocking: ["Missing state"],
+          evidence: [],
+        },
+      },
+      error: null,
     });
-    expect(getOpenFactoryForThread(db, "thread-1")).toMatchObject({
+    expect(getFactory(db, factory.id)).toMatchObject({ status: "rejected" });
+    expect(cancelRun(db, workflow.id)).toBe(false);
+    expect(getFactory(db, factory.id)).toMatchObject({ status: "rejected" });
+
+    const cancelled = createFactory(db, {
+      projectId: "project-1",
+      originThreadId: "thread-2",
+      request: "Cancel before approval",
+    });
+    expect(cancelFactory(db, cancelled.id)).toMatchObject({
       status: "cancelled",
     });
   });
@@ -360,6 +411,7 @@ describe("workflow durable data", () => {
     });
     expect(getCall(db, first.id, 0)?.resultJson).toBe("null");
     const second = createRun(db, {
+      factoryId: null,
       projectId: "project-1",
       originThreadId: "thread-1",
       environmentId: "environment-1",
@@ -615,6 +667,7 @@ describe("workflow durable data", () => {
        WHERE id = ?`,
     ).run(Date.now() - 3 * 86_400_000, parent.id);
     const retainedChild = createRun(db, {
+      factoryId: null,
       projectId: "project-1",
       originThreadId: "thread-1",
       environmentId: "environment-1",
@@ -649,6 +702,7 @@ describe("workflow durable data", () => {
   it("deletes an entirely expired resume chain in one bounded sweep", () => {
     const parent = newRun();
     const child = createRun(db, {
+      factoryId: null,
       projectId: "project-1",
       originThreadId: "thread-1",
       environmentId: "environment-1",

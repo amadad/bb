@@ -18,6 +18,7 @@ export const factoryStatusSchema = z.enum([
   "launching",
   "running",
   "candidate",
+  "rejected",
   "failed",
   "cancelled",
   "closed",
@@ -28,6 +29,8 @@ export const factoryViewSchema = z
     id: z.string(),
     request: z.string(),
     status: factoryStatusSchema,
+    approvalMode: z.enum(["user", "agent"]),
+    approvedBy: z.enum(["user", "agent"]).nullable(),
     brief: factoryBriefViewSchema.nullable(),
     workflowRunId: z.string().nullable(),
     error: z.string().nullable(),
@@ -114,6 +117,16 @@ export const workflowUiRpcContract = defineRpcContract({
   factoryOpenForThread: {
     input: threadLookupInputSchema,
     output: z.object({ factory: factoryViewSchema.nullable() }).strict(),
+  },
+  factorySetApprovalMode: {
+    input: z
+      .object({
+        threadId: z.string().trim().min(1),
+        factoryId: z.string().trim().min(1),
+        approvalMode: z.enum(["user", "agent"]),
+      })
+      .strict(),
+    output: z.object({ factory: factoryViewSchema }).strict(),
   },
   factoryApprove: {
     input: z

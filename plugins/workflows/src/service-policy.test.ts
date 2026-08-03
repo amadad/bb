@@ -176,6 +176,7 @@ function setup(
 
   async function start(workflowSource: string) {
     return service.start({
+      factoryId: null,
       projectId: "project-test",
       originThreadId: "origin",
       source: workflowSource,
@@ -802,6 +803,7 @@ describe("workflow service policy integration", () => {
     const ancestor = await test.start(source(`return "ancestor";`));
     await expect(
       test.service.start({
+        factoryId: null,
         projectId: "project-test",
         originThreadId: "origin-2",
         source: source(`return "resume";`),
@@ -817,6 +819,7 @@ describe("workflow service policy integration", () => {
       .run(Date.now(), ancestor.id);
     await expect(
       test.service.start({
+        factoryId: null,
         projectId: "project-test",
         originThreadId: "origin-2",
         source: source(`return "resume";`),
@@ -832,6 +835,7 @@ describe("workflow service policy integration", () => {
       .run(ancestor.id);
     await expect(
       test.service.start({
+        factoryId: null,
         projectId: "project-test",
         originThreadId: "origin-2",
         source: source(`return "resume";`),
@@ -902,9 +906,7 @@ describe("workflow service policy integration", () => {
   it("keeps quiet workers alive until the total run timeout", async () => {
     const test = setup();
     harnesses.push(test.harness);
-    const run = await test.start(
-      source(`return await agent("quiet");`),
-    );
+    const run = await test.start(source(`return await agent("quiet");`));
     const controller = new AbortController();
     const worker = test.service.runWorker(controller.signal);
     await eventually(() => expect(test.childCount()).toBe(1));

@@ -140,9 +140,18 @@ export default async function plugin(bb: BbPluginApi) {
         factory: engagement === null ? null : buildFactoryView(engagement),
       };
     },
+    async factorySetApprovalMode({ threadId, factoryId, approvalMode }) {
+      return {
+        factory: buildFactoryView(
+          await factory.setApprovalMode(factoryId, threadId, approvalMode),
+        ),
+      };
+    },
     async factoryApprove({ threadId, factoryId }) {
       return {
-        factory: buildFactoryView(await factory.approve(factoryId, threadId)),
+        factory: buildFactoryView(
+          await factory.approve(factoryId, threadId, "user"),
+        ),
       };
     },
     async factoryCancel({ threadId, factoryId }) {
@@ -179,7 +188,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "bb_factory_start",
     description:
-      "Start a durable BB Factory shaping engagement for a vague or substantial product request. Call this before researching or refining the request. The Factory does not write code until a structured shape is proposed with bb_factory_propose and the user explicitly approves it in BB. After starting, inspect the real workspace and ask only blocking owner questions. Do not call bb_workflow_run for the same request.",
+      "Start a durable BB Factory shaping engagement for a vague or substantial product request. Call this before researching or refining the request. Factory starts in Light mode, which requires user approval after bb_factory_propose. The user can select Dark mode in the Factory card to grant agent approval authority. After starting, inspect the real workspace and ask only blocking owner questions. Do not call bb_workflow_run for the same request.",
     parameters: factoryStartInputSchema,
     async execute({ request }, ctx) {
       try {
@@ -193,6 +202,7 @@ export default async function plugin(bb: BbPluginApi) {
           return jsonResult({
             factoryId: current.id,
             status: current.status,
+            approvalMode: current.approvalMode,
             resumed: true,
             request: current.request,
             next:
@@ -209,7 +219,8 @@ export default async function plugin(bb: BbPluginApi) {
         return jsonResult({
           factoryId: engagement.id,
           status: engagement.status,
-          next: "Inspect the workspace, make unknown facts concrete, and ask only decisions that materially change the result. Then call bb_factory_propose with the complete shape. The user approves from the Factory card.",
+          approvalMode: engagement.approvalMode,
+          next: "Inspect the workspace, make unknown facts concrete, and ask only decisions that materially change the result. Then call bb_factory_propose with the complete shape. Light waits for user approval. In Dark, the proposal also approves and launches the workflow.",
         });
       } catch (error) {
         return errorResult(
@@ -222,15 +233,23 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "bb_factory_propose",
     description:
-      "Freeze a concrete Factory shape after investigating the workspace and resolving blocking owner decisions. This only submits the proposal for user approval; it cannot launch production. Every acceptance criterion must be observable. Evidence must name inspected files, behavior, or sources rather than confidence claims.",
+      "Freeze a concrete Factory shape after investigating the workspace and resolving blocking owner decisions. Light waits for user approval. In Dark, this proposal also approves and launches the workflow. Every acceptance criterion must be observable. Evidence must name inspected files, behavior, or sources rather than confidence claims.",
     parameters: factoryProposeInputSchema,
     async execute({ factoryId, brief }, ctx) {
       try {
-        const engagement = factory.propose(factoryId, ctx.threadId, brief);
+        const engagement = await factory.propose(
+          factoryId,
+          ctx.threadId,
+          brief,
+        );
         return jsonResult({
           factoryId: engagement.id,
           status: engagement.status,
-          next: "Tell the user the Factory shape is ready in the card above the composer. Do not begin implementation or claim approval.",
+          approvalMode: engagement.approvalMode,
+          next:
+            engagement.approvalMode === "agent"
+              ? "The Dark Factory was agent-approved and launched from this proposal."
+              : "Tell the user the Light Factory shape is ready in the card above the composer. Do not begin implementation or claim approval.",
         });
       } catch (error) {
         return errorResult(
@@ -249,6 +268,7 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         const prepared = await prepareWorkflowSource(bb, ctx, input);
         const run = await service.start({
+          factoryId: null,
           projectId: ctx.projectId,
           originThreadId: ctx.threadId,
           source: prepared.source,

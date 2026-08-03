@@ -49,6 +49,7 @@ describe("workflow UI view", () => {
   it("preserves distinct undeclared phases and an empty current phase", () => {
     const run: WorkflowRunInspection = {
       id: "wfr_test",
+      factoryId: null,
       projectId: "proj_test",
       originThreadId: "thr_origin",
       environmentId: "env_test",

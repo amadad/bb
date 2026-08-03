@@ -22,9 +22,12 @@ export type FactoryStatus =
   | "launching"
   | "running"
   | "candidate"
+  | "rejected"
   | "failed"
   | "cancelled"
   | "closed";
+export type FactoryApprovalMode = "user" | "agent";
+export type FactoryApprover = "user" | "agent";
 
 export interface FactoryRow {
   id: string;
@@ -33,6 +36,8 @@ export interface FactoryRow {
   request: string;
   briefJson: string | null;
   status: FactoryStatus;
+  approvalMode: FactoryApprovalMode;
+  approvedBy: FactoryApprover | null;
   workflowRunId: string | null;
   error: string | null;
   createdAt: number;
@@ -43,6 +48,7 @@ export interface FactoryRow {
 
 export interface WorkflowRunRow {
   id: string;
+  factoryId: string | null;
   projectId: string;
   originThreadId: string;
   environmentId: string;
@@ -135,7 +141,8 @@ function optionalCall(value: unknown): WorkflowCallRow | null {
 }
 
 const RUN_SELECT = `
-  SELECT id, project_id AS projectId, origin_thread_id AS originThreadId,
+  SELECT id, factory_id AS factoryId, project_id AS projectId,
+    origin_thread_id AS originThreadId,
     environment_id AS environmentId, origin_provider AS originProvider,
     origin_model AS originModel, origin_reasoning_level AS originReasoningLevel,
     origin_permission_mode AS originPermissionMode,
@@ -155,6 +162,7 @@ const RUN_SELECT = `
 const FACTORY_SELECT = `
   SELECT id, project_id AS projectId, origin_thread_id AS originThreadId,
     request, brief_json AS briefJson, status,
+    approval_mode AS approvalMode, approved_by AS approvedBy,
     workflow_run_id AS workflowRunId, error, created_at AS createdAt,
     updated_at AS updatedAt, approved_at AS approvedAt, closed_at AS closedAt
   FROM factory_runs`;
@@ -271,6 +279,11 @@ export const migrations = [
      WHERE status IN ('shaping', 'awaiting_approval', 'launching', 'running');
    CREATE INDEX IF NOT EXISTS factory_runs_thread_created_idx
      ON factory_runs(origin_thread_id, created_at DESC);`,
+  `ALTER TABLE factory_runs ADD COLUMN approval_mode TEXT NOT NULL DEFAULT 'user';
+   ALTER TABLE factory_runs ADD COLUMN approved_by TEXT;
+   ALTER TABLE workflow_runs ADD COLUMN factory_id TEXT REFERENCES factory_runs(id);
+   CREATE UNIQUE INDEX IF NOT EXISTS workflow_runs_factory_idx
+     ON workflow_runs(factory_id) WHERE factory_id IS NOT NULL;`,
 ];
 
 export function createRun(
@@ -294,23 +307,48 @@ export function createRun(
     | "finishedAt"
   >,
 ): WorkflowRunRow {
-  const id = `wfr_${randomUUID()}`;
-  const now = Date.now();
-  db.prepare(
-    `INSERT INTO workflow_runs (
-       id, project_id, origin_thread_id, environment_id, origin_provider,
-       origin_model, origin_reasoning_level, origin_permission_mode,
-       name, source, source_hash,
-       args_json, settings_json, status, resumed_from_run_id,
-       replay_safety_version, created_at
-     ) VALUES (
-       @id, @projectId, @originThreadId, @environmentId, @originProvider,
-       @originModel, @originReasoningLevel, @originPermissionMode,
-       @name, @source, @sourceHash,
-       @argsJson, @settingsJson, 'queued', @resumedFromRunId, 1, @now
-     )`,
-  ).run({ id, now, ...input });
-  return getRunRequired(db, id);
+  return db.transaction(() => {
+    if (input.factoryId !== null) {
+      const claim = db
+        .prepare(
+          `SELECT id FROM factory_runs
+           WHERE id = ? AND status = 'launching' AND workflow_run_id IS NULL`,
+        )
+        .get(input.factoryId);
+      if (claim === undefined) {
+        throw new Error("Factory approval lost its launch claim");
+      }
+    }
+    const id = `wfr_${randomUUID()}`;
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO workflow_runs (
+         id, factory_id, project_id, origin_thread_id, environment_id,
+         origin_provider, origin_model, origin_reasoning_level,
+         origin_permission_mode, name, source, source_hash, args_json,
+         settings_json, status, resumed_from_run_id, replay_safety_version,
+         created_at
+       ) VALUES (
+         @id, @factoryId, @projectId, @originThreadId, @environmentId,
+         @originProvider, @originModel, @originReasoningLevel,
+         @originPermissionMode, @name, @source, @sourceHash, @argsJson,
+         @settingsJson, 'queued', @resumedFromRunId, 1, @now
+       )`,
+    ).run({ id, now, ...input });
+    if (input.factoryId !== null) {
+      const linked = db
+        .prepare(
+          `UPDATE factory_runs SET workflow_run_id = ?, status = 'running',
+           updated_at = ?
+           WHERE id = ? AND status = 'launching' AND workflow_run_id IS NULL`,
+        )
+        .run(id, now, input.factoryId).changes;
+      if (linked !== 1) {
+        throw new Error("Factory approval lost its launch claim");
+      }
+    }
+    return getRunRequired(db, id);
+  })();
 }
 
 export function getRun(db: Db, id: string): WorkflowRunRow | null {
@@ -390,6 +428,43 @@ export function claimQueuedRun(
   })();
 }
 
+function acceptedFactoryResult(result: JsonValue | null): boolean {
+  if (result === null || Array.isArray(result) || typeof result !== "object") {
+    return false;
+  }
+  const acceptance = result.acceptance;
+  return (
+    acceptance !== null &&
+    !Array.isArray(acceptance) &&
+    typeof acceptance === "object" &&
+    acceptance.approved === true
+  );
+}
+
+function projectFactoryTerminalState(
+  db: Db,
+  args: {
+    runId: string;
+    status: Extract<WorkflowRunStatus, "succeeded" | "failed" | "cancelled">;
+    result: JsonValue | null;
+    error: string | null;
+    now: number;
+  },
+): number {
+  const factoryStatus: FactoryStatus =
+    args.status === "succeeded"
+      ? acceptedFactoryResult(args.result)
+        ? "candidate"
+        : "rejected"
+      : args.status;
+  return db
+    .prepare(
+      `UPDATE factory_runs SET status = ?, error = ?, updated_at = ?
+       WHERE workflow_run_id = ? AND status = 'running'`,
+    )
+    .run(factoryStatus, args.error, args.now, args.runId).changes;
+}
+
 export function settleRun(
   db: Db,
   args: {
@@ -422,6 +497,13 @@ export function settleRun(
         now,
       }).changes;
     if (changed === 0) return [];
+    projectFactoryTerminalState(db, {
+      runId: args.id,
+      status: args.status,
+      result: args.result,
+      error: args.error,
+      now,
+    });
     db.prepare(
       `UPDATE workflow_calls SET status = 'cancelled',
        error = 'Parent workflow finished before this call', finished_at = ?
@@ -824,6 +906,15 @@ export function cancelRun(db: Db, id: string): boolean {
       `UPDATE workflow_calls SET status = 'cancelled', error = 'Cancelled', finished_at = ?
        WHERE run_id = ? AND status IN ('queued', 'running')`,
     ).run(now, id);
+    if (changed === 1) {
+      projectFactoryTerminalState(db, {
+        runId: id,
+        status: "cancelled",
+        result: null,
+        error: "Cancelled",
+        now,
+      });
+    }
     return changed === 1;
   })();
 }
@@ -875,7 +966,7 @@ export function createFactory(
     db.prepare(
       `UPDATE factory_runs SET status = 'closed', closed_at = ?, updated_at = ?
        WHERE origin_thread_id = ? AND closed_at IS NULL
-         AND status IN ('candidate', 'failed', 'cancelled')`,
+         AND status IN ('candidate', 'rejected', 'failed', 'cancelled')`,
     ).run(now, now, input.originThreadId);
     db.prepare(
       `INSERT INTO factory_runs (
@@ -932,39 +1023,80 @@ export function proposeFactoryBrief(
   return changed === 0 ? null : getFactoryRequired(db, id);
 }
 
-export function claimFactoryApproval(db: Db, id: string): FactoryRow | null {
+export function setFactoryApprovalMode(
+  db: Db,
+  id: string,
+  approvalMode: FactoryApprovalMode,
+): FactoryRow | null {
   const changed = db
     .prepare(
-      `UPDATE factory_runs SET status = 'launching', updated_at = ?
-       WHERE id = ? AND status = 'awaiting_approval' AND brief_json IS NOT NULL`,
+      `UPDATE factory_runs SET approval_mode = ?, updated_at = ?
+       WHERE id = ? AND status IN ('shaping', 'awaiting_approval')`,
     )
-    .run(Date.now(), id).changes;
+    .run(approvalMode, Date.now(), id).changes;
+  return changed === 0 ? null : getFactoryRequired(db, id);
+}
+
+export function claimFactoryApproval(
+  db: Db,
+  id: string,
+  approver: FactoryApprover,
+): FactoryRow | null {
+  const now = Date.now();
+  const changed = db
+    .prepare(
+      `UPDATE factory_runs SET status = 'launching', approved_by = ?,
+       approved_at = ?, updated_at = ?
+       WHERE id = ? AND status = 'awaiting_approval' AND brief_json IS NOT NULL
+         AND approval_mode = ?`,
+    )
+    .run(approver, now, now, id, approver).changes;
   return changed === 0 ? null : getFactoryRequired(db, id);
 }
 
 export function recoverFactoryApprovals(db: Db): number {
   return db
     .prepare(
-      `UPDATE factory_runs SET status = 'awaiting_approval', updated_at = ?
+      `UPDATE factory_runs SET status = 'awaiting_approval', approved_by = NULL,
+       approved_at = NULL, updated_at = ?
        WHERE status = 'launching' AND workflow_run_id IS NULL`,
     )
     .run(Date.now()).changes;
 }
 
-export function attachFactoryWorkflow(
-  db: Db,
-  id: string,
-  workflowRunId: string,
-): FactoryRow | null {
-  const now = Date.now();
-  const changed = db
+export function recoverFactoryTerminalStates(db: Db): number {
+  const rows = db
     .prepare(
-      `UPDATE factory_runs SET workflow_run_id = ?, status = 'running',
-       approved_at = ?, updated_at = ?
-       WHERE id = ? AND status = 'launching' AND workflow_run_id IS NULL`,
+      `SELECT runs.id AS runId, runs.status, runs.result_json AS resultJson,
+       runs.error, runs.finished_at AS finishedAt
+       FROM factory_runs factories
+       JOIN workflow_runs runs ON runs.id = factories.workflow_run_id
+       WHERE factories.status = 'running'
+         AND runs.status IN ('succeeded', 'failed', 'cancelled')`,
     )
-    .run(workflowRunId, now, now, id).changes;
-  return changed === 0 ? null : getFactoryRequired(db, id);
+    .all() as Array<{
+    runId: string;
+    status: Extract<WorkflowRunStatus, "succeeded" | "failed" | "cancelled">;
+    resultJson: string | null;
+    error: string | null;
+    finishedAt: number | null;
+  }>;
+  return db.transaction(() => {
+    let recovered = 0;
+    for (const row of rows) {
+      recovered += projectFactoryTerminalState(db, {
+        runId: row.runId,
+        status: row.status,
+        result:
+          row.resultJson === null
+            ? null
+            : (JSON.parse(row.resultJson) as JsonValue),
+        error: row.error,
+        now: row.finishedAt ?? Date.now(),
+      });
+    }
+    return recovered;
+  })();
 }
 
 export function failFactoryLaunch(
@@ -981,35 +1113,13 @@ export function failFactoryLaunch(
   return changed === 0 ? null : getFactoryRequired(db, id);
 }
 
-export function syncFactoryFromWorkflow(db: Db, id: string): FactoryRow {
-  const factory = getFactoryRequired(db, id);
-  if (factory.status !== "running" || factory.workflowRunId === null) {
-    return factory;
-  }
-  const workflow = getRun(db, factory.workflowRunId);
-  if (
-    workflow === null ||
-    workflow.status === "queued" ||
-    workflow.status === "running"
-  ) {
-    return factory;
-  }
-  const status: FactoryStatus =
-    workflow.status === "succeeded" ? "candidate" : workflow.status;
-  db.prepare(
-    `UPDATE factory_runs SET status = ?, error = ?, updated_at = ?
-     WHERE id = ? AND status = 'running'`,
-  ).run(status, workflow.error, Date.now(), id);
-  return getFactoryRequired(db, id);
-}
-
 export function cancelFactory(db: Db, id: string): FactoryRow | null {
   const changed = db
     .prepare(
       `UPDATE factory_runs SET status = 'cancelled', error = 'Cancelled',
        updated_at = ?
        WHERE id = ? AND status IN
-         ('shaping', 'awaiting_approval', 'launching', 'running')`,
+         ('shaping', 'awaiting_approval', 'launching')`,
     )
     .run(Date.now(), id).changes;
   return changed === 0 ? null : getFactoryRequired(db, id);
@@ -1020,7 +1130,8 @@ export function closeFactory(db: Db, id: string): FactoryRow | null {
   const changed = db
     .prepare(
       `UPDATE factory_runs SET status = 'closed', closed_at = ?, updated_at = ?
-       WHERE id = ? AND status IN ('candidate', 'failed', 'cancelled')`,
+       WHERE id = ? AND status IN
+         ('candidate', 'rejected', 'failed', 'cancelled')`,
     )
     .run(now, now, id).changes;
   return changed === 0 ? null : getFactoryRequired(db, id);

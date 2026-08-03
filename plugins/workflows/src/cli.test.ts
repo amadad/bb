@@ -166,7 +166,6 @@ describe("workflows CLI argument validation", () => {
       "factory-start",
       "factory-propose",
       "factory-status",
-      "factory-approve",
       "factory-stop",
       "factory-close",
     ]);

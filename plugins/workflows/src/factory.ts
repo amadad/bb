@@ -1,6 +1,5 @@
 import { z } from "zod";
 import {
-  attachFactoryWorkflow,
   cancelFactory,
   claimFactoryApproval,
   closeFactory,
@@ -10,8 +9,11 @@ import {
   getOpenFactoryForThread,
   proposeFactoryBrief,
   recoverFactoryApprovals,
-  syncFactoryFromWorkflow,
+  recoverFactoryTerminalStates,
+  setFactoryApprovalMode,
   type Db,
+  type FactoryApprover,
+  type FactoryApprovalMode,
   type FactoryRow,
 } from "./data.js";
 import type { WorkflowService } from "./service.js";
@@ -123,7 +125,7 @@ let build = await agent(
 );
 phase("Verify");
 let review = await agent(
-  "Act as a fresh acceptance verifier. Inspect the actual workspace and diff. Independently run the relevant repository checks and exercise the approved user journey where possible. Reject placeholders, mocked-only proof, missing states, stale checks, and claims without evidence. Context: " + context + " Builder report: " + JSON.stringify(build),
+  "Act as a fresh acceptance verifier. Do not edit files. Inspect the actual workspace and diff. Independently run the relevant repository checks and exercise the approved user journey where possible. Reject placeholders, mocked-only proof, missing states, stale checks, and claims without evidence. Judge only the frozen brief, not the builder's claims. Context: " + context,
   { title: "Verify candidate", outputSchema: ${REVIEW_SCHEMA} }
 );
 if (!review.approved) {
@@ -134,12 +136,9 @@ if (!review.approved) {
   );
   phase("Acceptance");
   review = await agent(
-    "Re-run acceptance from fresh evidence after the revision. Inspect the actual workspace, rerun relevant checks, and judge only against the approved Factory brief. Reject unsupported claims. Context: " + context + " Revised builder report: " + JSON.stringify(build),
+    "Re-run acceptance from fresh evidence after the revision. Do not edit files. Inspect the actual workspace, rerun relevant checks, and judge only against the approved Factory brief. Reject unsupported claims. Context: " + context,
     { title: "Accept candidate", outputSchema: ${REVIEW_SCHEMA} }
   );
-}
-if (!review.approved) {
-  throw new Error("Factory candidate did not pass independent acceptance: " + JSON.stringify(review.blocking));
 }
 return { build, acceptance: review };`;
 
@@ -166,8 +165,21 @@ export interface FactoryService {
     originThreadId: string;
     request: string;
   }): FactoryInspection;
-  propose(id: string, threadId: string, brief: FactoryBrief): FactoryInspection;
-  approve(id: string, threadId: string): Promise<FactoryInspection>;
+  propose(
+    id: string,
+    threadId: string,
+    brief: FactoryBrief,
+  ): Promise<FactoryInspection>;
+  setApprovalMode(
+    id: string,
+    threadId: string,
+    approvalMode: FactoryApprovalMode,
+  ): Promise<FactoryInspection>;
+  approve(
+    id: string,
+    threadId: string,
+    approver: FactoryApprover,
+  ): Promise<FactoryInspection>;
   inspect(id: string): FactoryInspection | null;
   inspectOpenForThread(threadId: string): FactoryInspection | null;
   cancel(id: string, threadId: string): Promise<FactoryInspection>;
@@ -179,10 +191,51 @@ export function createFactoryService(
   workflows: WorkflowService,
 ): FactoryService {
   recoverFactoryApprovals(db);
+  recoverFactoryTerminalStates(db);
 
   function inspect(id: string): FactoryInspection | null {
     const row = getFactory(db, id);
-    return row === null ? null : inspection(syncFactoryFromWorkflow(db, id));
+    return row === null ? null : inspection(row);
+  }
+
+  async function approve(
+    id: string,
+    threadId: string,
+    approver: FactoryApprover,
+  ): Promise<FactoryInspection> {
+    const current = requireThread(getFactory(db, id), threadId);
+    if (current.status !== "awaiting_approval" || current.briefJson === null) {
+      throw new Error("Factory is not awaiting approval");
+    }
+    if (current.approvalMode !== approver) {
+      throw new Error(
+        current.approvalMode === "user"
+          ? "Light Factory requires user approval"
+          : "Dark Factory requires agent approval",
+      );
+    }
+    const claimed = claimFactoryApproval(db, id, approver);
+    if (claimed === null)
+      throw new Error("Factory approval was already handled");
+    const brief = factoryBriefSchema.parse(JSON.parse(current.briefJson));
+    try {
+      await workflows.start({
+        projectId: current.projectId,
+        originThreadId: current.originThreadId,
+        source: BUILT_IN_FACTORY_WORKFLOW_SOURCE,
+        args: { request: current.request, brief },
+        resumedFromRunId: null,
+        factoryId: id,
+      });
+      return inspection(getFactory(db, id)!);
+    } catch (error) {
+      failFactoryLaunch(
+        db,
+        id,
+        error instanceof Error ? error.message : String(error),
+      );
+      throw error;
+    }
   }
 
   return {
@@ -190,50 +243,28 @@ export function createFactoryService(
       const request = boundedText.parse(input.request);
       return inspection(createFactory(db, { ...input, request }));
     },
-    propose(id, threadId, value) {
+    async propose(id, threadId, value) {
       requireThread(getFactory(db, id), threadId);
       const brief = factoryBriefSchema.parse(value);
       const row = proposeFactoryBrief(db, id, JSON.stringify(brief));
       if (row === null) {
         throw new Error("Factory is not accepting a shape proposal");
       }
-      return inspection(row);
+      return row.approvalMode === "agent"
+        ? approve(id, threadId, "agent")
+        : inspection(row);
     },
-    async approve(id, threadId) {
-      const current = requireThread(getFactory(db, id), threadId);
-      if (
-        current.status !== "awaiting_approval" ||
-        current.briefJson === null
-      ) {
-        throw new Error("Factory is not awaiting approval");
+    async setApprovalMode(id, threadId, approvalMode) {
+      requireThread(getFactory(db, id), threadId);
+      const row = setFactoryApprovalMode(db, id, approvalMode);
+      if (row === null) {
+        throw new Error("Factory approval mode can no longer be changed");
       }
-      const claimed = claimFactoryApproval(db, id);
-      if (claimed === null)
-        throw new Error("Factory approval was already handled");
-      const brief = factoryBriefSchema.parse(JSON.parse(current.briefJson));
-      try {
-        const run = await workflows.start({
-          projectId: current.projectId,
-          originThreadId: current.originThreadId,
-          source: BUILT_IN_FACTORY_WORKFLOW_SOURCE,
-          args: { request: current.request, brief },
-          resumedFromRunId: null,
-        });
-        const attached = attachFactoryWorkflow(db, id, run.id);
-        if (attached === null) {
-          await workflows.stop(run.id);
-          throw new Error("Factory approval lost its launch claim");
-        }
-        return inspection(attached);
-      } catch (error) {
-        failFactoryLaunch(
-          db,
-          id,
-          error instanceof Error ? error.message : String(error),
-        );
-        throw error;
-      }
+      return row.status === "awaiting_approval" && approvalMode === "agent"
+        ? approve(id, threadId, "agent")
+        : inspection(row);
     },
+    approve,
     inspect,
     inspectOpenForThread(threadId) {
       const row = getOpenFactoryForThread(db, threadId);
@@ -243,6 +274,7 @@ export function createFactoryService(
       const current = requireThread(inspect(id), threadId);
       if (current.workflowRunId !== null && current.status === "running") {
         await workflows.stop(current.workflowRunId);
+        return inspection(getFactory(db, id)!);
       }
       const row = cancelFactory(db, id);
       if (row === null)

@@ -338,6 +338,7 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 export interface StartWorkflowInput {
+  factoryId: string | null;
   projectId: string;
   originThreadId: string;
   source: string;
@@ -499,6 +500,7 @@ export function createWorkflowService(
       }
     }
     return createRun(db, {
+      factoryId: input.factoryId,
       projectId: input.projectId,
       originThreadId: input.originThreadId,
       environmentId: origin.environmentId,

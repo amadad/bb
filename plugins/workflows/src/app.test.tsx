@@ -22,6 +22,8 @@ const factory: FactoryView = {
   id: "fac_11111111-1111-4111-8111-111111111111",
   request: "Make onboarding useful",
   status: "awaiting_approval",
+  approvalMode: "user",
+  approvedBy: null,
   brief: {
     outcome: "A new user reaches useful value without setup confusion.",
     userJourney: "Create an account and complete the first useful action.",
@@ -164,7 +166,47 @@ describe("workflows app registration", () => {
 describe("Factory composer banner", () => {
   const banner = app.composerCustomizations[1]!.banners![0]!;
 
-  it("shows the frozen shape and launches only from explicit approval", async () => {
+  it("lets the user select Light or Dark before approval", async () => {
+    const shapingFactory: FactoryView = {
+      ...factory,
+      status: "shaping",
+      brief: null,
+    };
+    const slot = renderSlot(
+      banner,
+      {},
+      {
+        composer: { scope: { kind: "thread", threadId: "thr_scope" } },
+        rpc: {
+          factoryOpenForThread: () => ({ factory: shapingFactory }),
+          factorySetApprovalMode: (input) => ({
+            factory: {
+              ...shapingFactory,
+              approvalMode: (
+                input as { approvalMode: FactoryView["approvalMode"] }
+              ).approvalMode,
+            },
+          }),
+        },
+      },
+    );
+
+    expect(await slot.findByText(/Light · User approval/i)).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: /use Dark mode/i }));
+    await waitFor(() =>
+      expect(slot.rpcCalls).toContainEqual({
+        method: "factorySetApprovalMode",
+        input: {
+          threadId: "thr_scope",
+          factoryId: factory.id,
+          approvalMode: "agent",
+        },
+      }),
+    );
+    expect(await slot.findByText(/Dark · Agent approval/i)).toBeTruthy();
+  });
+
+  it("shows the frozen shape and launches only from explicit Light approval", async () => {
     const slot = renderSlot(
       banner,
       {},
@@ -195,6 +237,30 @@ describe("Factory composer banner", () => {
       }),
     );
     expect(await slot.findByText(/building candidate/i)).toBeTruthy();
+  });
+
+  it("stops polling when Factory is terminal", async () => {
+    vi.useFakeTimers();
+    let polls = 0;
+    const slot = renderSlot(
+      banner,
+      {},
+      {
+        composer: { scope: { kind: "thread", threadId: "thr_scope" } },
+        rpc: {
+          factoryOpenForThread: () => {
+            polls += 1;
+            return { factory: { ...factory, status: "candidate" } };
+          },
+        },
+      },
+    );
+
+    await act(async () => Promise.resolve());
+    expect(polls).toBe(1);
+    await act(async () => vi.advanceTimersByTimeAsync(3_000));
+    expect(polls).toBe(1);
+    slot.unmount();
   });
 });
 

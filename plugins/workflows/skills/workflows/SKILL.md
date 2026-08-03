@@ -24,19 +24,21 @@ During shaping:
    acceptance criteria, constraints, non-goals, and evidence handles.
 6. Submit it through `bb_factory_propose`.
 
-A proposal does not authorize implementation. Tell the user that the shape is
-ready in the Factory card above the composer. Do not infer consent, call
-`bb_workflow_run`, edit code, or begin production while the engagement is
-`awaiting_approval`. The server launches the built-in Factory workflow only
-after the user selects **Approve and run** or invokes the explicit CLI approval
-command.
+A proposal does not authorize implementation. Read `approvalMode` from the tool
+result. In Light mode, tell the user that the shape is ready in the Factory card
+and wait for **Approve and run**. In Dark mode, the proposal also approves and
+launches the workflow. Never attempt separate approval for a Light Factory. Do
+not call `bb_workflow_run`, edit code, or begin production while a Light
+engagement is `awaiting_approval`.
 
 The built-in workflow runs `Plan → Build → Verify`, permits one bounded
 `Revise → Acceptance` pass after a rejection, and returns both the builder's
 report and independent acceptance evidence. It inherits the origin thread's
 provider and execution settings, but lifecycle semantics are BB-owned and
-provider-independent. It does not commit, push, merge, or deploy. Treat a
-successful run as a candidate for user review, not external-action consent.
+provider-independent. Workers are instructed not to commit, push, merge, or
+deploy. Factory does not grant external-action consent; permission mode and
+host tools remain the enforcement boundary. Treat an accepted candidate as
+ready for user review and a rejected candidate as terminal evidence.
 
 Factory CLI equivalents:
 
@@ -44,7 +46,6 @@ Factory CLI equivalents:
 bb workflows factory-start --request '<outcome>'
 bb workflows factory-propose <factory-id> --brief '<json>'
 bb workflows factory-status <factory-id>
-bb workflows factory-approve <factory-id>
 bb workflows factory-stop <factory-id>
 bb workflows factory-close <factory-id>
 ```
@@ -526,7 +527,6 @@ bb workflows stop <run-id>
 bb workflows factory-start --request '<outcome>'
 bb workflows factory-propose <factory-id> --brief '<json>'
 bb workflows factory-status <factory-id>
-bb workflows factory-approve <factory-id>
 bb workflows factory-stop <factory-id>
 bb workflows factory-close <factory-id>
 bb provider list --environment "$BB_ENVIRONMENT_ID" --json

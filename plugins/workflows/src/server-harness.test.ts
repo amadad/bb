@@ -99,7 +99,13 @@ describe("workflows plugin", () => {
       await harness.callRpc("factoryOpenForThread", {
         threadId: "thread-test",
       }),
-    ).toMatchObject({ factory: { id: started.factoryId, status: "shaping" } });
+    ).toMatchObject({
+      factory: {
+        id: started.factoryId,
+        status: "shaping",
+        approvalMode: "user",
+      },
+    });
 
     const brief = {
       outcome: "A new user reaches useful value",
@@ -121,6 +127,10 @@ describe("workflows plugin", () => {
       factory: { status: "awaiting_approval", brief, workflowRunId: null },
     });
 
+    expect(
+      harness.registrations.cli?.commands.map((command) => command.name),
+    ).not.toContain("factory-approve");
+
     const approved = await harness.callRpc("factoryApprove", {
       threadId: "thread-test",
       factoryId: started.factoryId,
@@ -136,6 +146,36 @@ describe("workflows plugin", () => {
         threadId: "thread-test",
       }),
     ).toMatchObject({ runs: [{ name: "factory", status: "queued" }] });
+
+    const darkStarted = JSON.parse(
+      String(
+        await harness.callAgentTool(
+          "bb_factory_start",
+          { request: "Build in Dark mode" },
+          { threadId: "thread-dark", projectId: "project-test" },
+        ),
+      ),
+    ) as { factoryId: string };
+    await expect(
+      harness.callRpc("factorySetApprovalMode", {
+        threadId: "thread-dark",
+        factoryId: darkStarted.factoryId,
+        approvalMode: "agent",
+      }),
+    ).resolves.toMatchObject({ factory: { approvalMode: "agent" } });
+    const darkProposal = JSON.parse(
+      String(
+        await harness.callAgentTool(
+          "bb_factory_propose",
+          { factoryId: darkStarted.factoryId, brief },
+          { threadId: "thread-dark", projectId: "project-test" },
+        ),
+      ),
+    ) as { status: string; approvalMode: string };
+    expect(darkProposal).toMatchObject({
+      status: "running",
+      approvalMode: "agent",
+    });
   });
 
   it("runs a structured workflow asynchronously and notifies its origin", async () => {
@@ -808,6 +848,7 @@ describe("workflows plugin", () => {
       description: "Host value test",
     }; return null;`;
     const base = {
+      factoryId: null,
       projectId: "project-test",
       originThreadId: "thread-test",
       source,
@@ -922,6 +963,7 @@ describe("workflow resume cache integration", () => {
 
     async function start(source: string, resumedFromRunId: string | null) {
       return service.start({
+        factoryId: null,
         projectId: "project-test",
         originThreadId: "origin",
         source,

@@ -104,6 +104,12 @@ function isRunActive(run: WorkflowRunView): boolean {
   return run.status === "queued" || run.status === "running";
 }
 
+function isFactoryActive(factory: FactoryView): boolean {
+  return ["shaping", "awaiting_approval", "launching", "running"].includes(
+    factory.status,
+  );
+}
+
 function runTerminalState(
   run: WorkflowRunView,
 ): "completed" | "failed" | "cancelled" | undefined {
@@ -515,18 +521,25 @@ function FactoryBriefSummary({ factory }: { factory: FactoryView }) {
         <span className="font-medium text-foreground">Journey:</span>{" "}
         {brief.userJourney}
       </p>
-      {sections.map(([label, items]) =>
-        items.length === 0 ? null : (
-          <div key={label}>
-            <p className="font-medium text-foreground">{label}</p>
-            <ul className="list-disc space-y-0.5 pl-4">
-              {items.map((item) => (
-                <li key={item}>{item}</li>
-              ))}
-            </ul>
-          </div>
-        ),
-      )}
+      <details>
+        <summary className="cursor-pointer font-medium text-foreground">
+          Review brief details
+        </summary>
+        <div className="mt-2 max-h-64 space-y-2 overflow-y-auto pr-1">
+          {sections.map(([label, items]) =>
+            items.length === 0 ? null : (
+              <div key={label}>
+                <p className="font-medium text-foreground">{label}</p>
+                <ul className="list-disc space-y-0.5 pl-4">
+                  {items.map((item, index) => (
+                    <li key={`${index}:${item}`}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            ),
+          )}
+        </div>
+      </details>
     </div>
   );
 }
@@ -535,30 +548,33 @@ function FactoryStatusBannerLoaded({ threadId }: { threadId: string }) {
   const rpc = useRpc<typeof workflowUiRpcContract>();
   const navigate = useBbNavigate();
   const [factory, setFactory] = useState<FactoryView | null>(null);
-  const [pending, setPending] = useState<"approve" | "cancel" | "close" | null>(
-    null,
-  );
+  const [pending, setPending] = useState<
+    "mode" | "approve" | "cancel" | "close" | null
+  >(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     let timeout: number | null = null;
-    const refresh = async () => {
+    const refresh = async (): Promise<boolean> => {
       try {
         const result = await rpc.call("factoryOpenForThread", { threadId });
         if (!cancelled) setFactory(result.factory);
+        return result.factory !== null && isFactoryActive(result.factory);
       } catch {
-        // The next poll repairs transient connection failures.
+        return true;
       }
     };
     const schedule = () => {
       timeout = window.setTimeout(() => {
-        void refresh().finally(() => {
-          if (!cancelled) schedule();
+        void refresh().then((keepPolling) => {
+          if (!cancelled && keepPolling) schedule();
         });
       }, ACTIVE_POLL_INTERVAL_MS);
     };
-    void refresh().finally(schedule);
+    void refresh().then((keepPolling) => {
+      if (!cancelled && keepPolling) schedule();
+    });
     return () => {
       cancelled = true;
       if (timeout !== null) window.clearTimeout(timeout);
@@ -566,12 +582,7 @@ function FactoryStatusBannerLoaded({ threadId }: { threadId: string }) {
   }, [rpc, threadId]);
 
   if (factory === null) return null;
-  const isActive = [
-    "shaping",
-    "awaiting_approval",
-    "launching",
-    "running",
-  ].includes(factory.status);
+  const isActive = isFactoryActive(factory);
   const statusText =
     factory.status === "shaping"
       ? "Shaping request"
@@ -581,11 +592,30 @@ function FactoryStatusBannerLoaded({ threadId }: { threadId: string }) {
           ? "Building candidate"
           : factory.status === "candidate"
             ? "Candidate ready"
-            : factory.status === "failed"
-              ? "Factory failed"
-              : factory.status === "cancelled"
-                ? "Factory cancelled"
-                : "Factory closed";
+            : factory.status === "rejected"
+              ? "Candidate rejected"
+              : factory.status === "failed"
+                ? "Factory failed"
+                : factory.status === "cancelled"
+                  ? "Factory cancelled"
+                  : "Factory closed";
+
+  const setMode = async (approvalMode: FactoryView["approvalMode"]) => {
+    setPending("mode");
+    setActionError(null);
+    try {
+      const result = await rpc.call("factorySetApprovalMode", {
+        threadId,
+        factoryId: factory.id,
+        approvalMode,
+      });
+      setFactory(result.factory);
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPending(null);
+    }
+  };
 
   const act = async (action: "approve" | "cancel" | "close") => {
     setPending(action);
@@ -654,6 +684,45 @@ function FactoryStatusBannerLoaded({ threadId }: { threadId: string }) {
         )}
       </div>
       <div className="space-y-2 border-t border-border px-3 py-2.5">
+        <div className="flex items-center justify-between gap-2 text-xs">
+          <span className="font-medium text-foreground">
+            {factory.approvalMode === "user"
+              ? "Light · User approval"
+              : "Dark · Agent approval"}
+          </span>
+          {factory.status === "shaping" ||
+          factory.status === "awaiting_approval" ? (
+            <div className="flex gap-1" role="group" aria-label="Factory mode">
+              <Button
+                type="button"
+                size="sm"
+                variant={
+                  factory.approvalMode === "user" ? "default" : "outline"
+                }
+                disabled={pending !== null}
+                aria-label="Use Light mode"
+                onClick={() => void setMode("user")}
+              >
+                Light
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={
+                  factory.approvalMode === "agent" ? "default" : "outline"
+                }
+                disabled={pending !== null}
+                aria-label="Use Dark mode"
+                onClick={() => void setMode("agent")}
+              >
+                Dark
+              </Button>
+            </div>
+          ) : null}
+        </div>
+        <p className="text-xs text-muted-foreground">
+          3–5 workers · Inherits this thread&apos;s execution settings
+        </p>
         <FactoryBriefSummary factory={factory} />
         {factory.error === null && actionError === null ? null : (
           <p className="text-xs text-destructive-text">
@@ -661,7 +730,8 @@ function FactoryStatusBannerLoaded({ threadId }: { threadId: string }) {
           </p>
         )}
         <div className="flex items-center justify-end gap-2">
-          {factory.status === "awaiting_approval" ? (
+          {factory.status === "awaiting_approval" &&
+          factory.approvalMode === "user" ? (
             <Button
               type="button"
               size="sm"

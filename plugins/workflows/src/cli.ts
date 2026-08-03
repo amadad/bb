@@ -40,6 +40,8 @@ function factoryCliView(factory: FactoryInspection) {
     request: factory.request,
     brief: factory.brief,
     status: factory.status,
+    approvalMode: factory.approvalMode,
+    approvedBy: factory.approvedBy,
     workflowRunId: factory.workflowRunId,
     error: factory.error,
     createdAt: factory.createdAt,
@@ -426,11 +428,6 @@ export function registerWorkflowCli(
         usage: "bb workflows factory-status <factory-id>",
       },
       {
-        name: "factory-approve",
-        summary: "Approve a frozen Factory shape and launch production",
-        usage: "bb workflows factory-approve <factory-id>",
-      },
-      {
         name: "factory-stop",
         summary: "Cancel an active Factory engagement",
         usage: "bb workflows factory-stop <factory-id>",
@@ -460,6 +457,7 @@ export function registerWorkflowCli(
             sourceInput(options, ctx.cwd),
           );
           const run = await service.start({
+            factoryId: null,
             projectId: context.projectId,
             originThreadId: context.threadId,
             source: prepared.source,
@@ -603,7 +601,7 @@ export function registerWorkflowCli(
           }
           return success(
             factoryCliView(
-              factory.propose(
+              await factory.propose(
                 positionals[0]!,
                 context.threadId,
                 factoryBriefSchema.parse(parsedBrief),
@@ -626,19 +624,6 @@ export function registerWorkflowCli(
             throw new Error(`Unknown Factory engagement ${positionals[0]}`);
           }
           return success(factoryCliView(engagement));
-        }
-        if (command === "factory-approve") {
-          const { positionals } = parseArguments(
-            argv.slice(1),
-            [],
-            "factory-approve",
-          );
-          const context = requireContext(ctx);
-          return success(
-            factoryCliView(
-              await factory.approve(positionals[0]!, context.threadId),
-            ),
-          );
         }
         if (command === "factory-stop") {
           const { positionals } = parseArguments(
@@ -665,7 +650,7 @@ export function registerWorkflowCli(
           );
         }
         return failure(
-          "Usage: bb workflows <run|validate|status|history|list|stop|factory-start|factory-propose|factory-status|factory-approve|factory-stop|factory-close> [options]",
+          "Usage: bb workflows <run|validate|status|history|list|stop|factory-start|factory-propose|factory-status|factory-stop|factory-close> [options]",
         );
       } catch (error) {
         return failure(error instanceof Error ? error.message : String(error));

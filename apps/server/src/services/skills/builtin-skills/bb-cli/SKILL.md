@@ -515,14 +515,15 @@ add <key-or-comment-id> --file <path>` (task key = task-level; comment ID
   from the final page record's `nextCursor`. This shell redirection writes on
   the thread's execution host, including remote hosts; do not print the raw
   history into the agent transcript. Cancel with `bb workflows stop <run-id>`.
-- Factory turns an investigated shape into an explicitly approved candidate.
-  Use `bb workflows factory-start --request <outcome>`, then
-  `factory-propose <factory-id> --brief <json>`. Inspect with `factory-status`.
-  Only `factory-approve <factory-id>` may launch production. Use
-  `factory-stop` to cancel and `factory-close` to dismiss a terminal
-  engagement. The built-in run performs Plan, Build, independent Verify, one
-  bounded Revise when needed, and fresh Acceptance. It does not commit, push,
-  merge, or deploy.
+- Factory turns an investigated shape into an approved candidate. It starts in
+  Light mode, where only the user can approve in the composer card. The user
+  may switch the card to Dark mode, where `factory-propose <factory-id>
+--brief <json>` also approves and launches the workflow. Agents cannot change
+  the mode. Inspect with `factory-status`, cancel
+  with `factory-stop`, and dismiss a terminal engagement with `factory-close`.
+  The built-in run performs Plan, Build, independent Verify, one bounded Revise
+  when needed, and fresh Acceptance. Workers are instructed not to commit,
+  push, merge, or deploy; permission mode and host tools enforce capabilities.
 - Before choosing an explicit provider/model/reasoning tuple, run `bb provider
 list --environment "$BB_ENVIRONMENT_ID" --json`, then query only the chosen
   provider with `bb provider models <provider-id> --environment
