@@ -139,7 +139,6 @@ describe("workflows app registration", () => {
         clear: vi.fn(),
         setTextEffect: vi.fn(),
         setInputLock: vi.fn(),
-        setThreadRowStatus: vi.fn(),
         addQuote: vi.fn(),
         insertMention: vi.fn(),
         focus,
