@@ -59,6 +59,85 @@ describe("workflows plugin", () => {
     await harness.setSettings({ maxActiveRuns: "5" });
   });
 
+  it("holds Factory work behind a durable explicit approval gate", async () => {
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "workflows",
+      agentSkillIds: ["workflows"],
+      sdk: {
+        threads: {
+          get: async ({ threadId }) =>
+            ({
+              id: threadId,
+              environmentId: "environment-1",
+              providerId: "codex",
+              status: "idle",
+            }) as never,
+          defaultExecutionOptions: async () => ({
+            model: "gpt-test",
+            reasoningLevel: "medium",
+            permissionMode: "full",
+            serviceTier: "default",
+            source: "default",
+          }),
+          send: async () => ({ ok: true }),
+          stop: async () => ({ ok: true }),
+        },
+      },
+    });
+    hosts.push(harness);
+    await plugin(bb);
+
+    const started = JSON.parse(
+      String(
+        await harness.callAgentTool("bb_factory_start", {
+          request: "Make onboarding useful",
+        }),
+      ),
+    ) as { factoryId: string; status: string };
+    expect(started).toMatchObject({ status: "shaping" });
+    expect(
+      await harness.callRpc("factoryOpenForThread", {
+        threadId: "thread-test",
+      }),
+    ).toMatchObject({ factory: { id: started.factoryId, status: "shaping" } });
+
+    const brief = {
+      outcome: "A new user reaches useful value",
+      userJourney: "Complete the first useful action",
+      acceptanceCriteria: ["The primary journey works end to end"],
+      constraints: ["Preserve existing accounts"],
+      nonGoals: ["Redesign settings"],
+      evidence: ["Inspected the onboarding route"],
+    };
+    await harness.callAgentTool("bb_factory_propose", {
+      factoryId: started.factoryId,
+      brief,
+    });
+    expect(
+      await harness.callRpc("factoryOpenForThread", {
+        threadId: "thread-test",
+      }),
+    ).toMatchObject({
+      factory: { status: "awaiting_approval", brief, workflowRunId: null },
+    });
+
+    const approved = await harness.callRpc("factoryApprove", {
+      threadId: "thread-test",
+      factoryId: started.factoryId,
+    });
+    expect(approved).toMatchObject({
+      factory: {
+        status: "running",
+        workflowRunId: expect.stringMatching(/^wfr_/),
+      },
+    });
+    expect(
+      await harness.callRpc("workflowActiveRuns", {
+        threadId: "thread-test",
+      }),
+    ).toMatchObject({ runs: [{ name: "factory", status: "queued" }] });
+  });
+
   it("runs a structured workflow asynchronously and notifies its origin", async () => {
     let childCount = 0;
     const { bb, harness } = createFakePluginHost({
@@ -279,6 +358,8 @@ describe("workflows plugin", () => {
       origin: { kind: null, pluginId: null },
     });
     expect(authorConfig.tools.map((tool) => tool.name)).toEqual([
+      "bb_factory_start",
+      "bb_factory_propose",
       "bb_workflow_run",
     ]);
     expect(authorConfig.skills).toEqual(["workflows"]);

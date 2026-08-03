@@ -36,7 +36,11 @@ import {
   type PluginThreadPanelProps,
 } from "@bb/plugin-sdk/app";
 import type { workflowUiRpcContract } from "./ui-contract.js";
-import type { WorkflowCallView, WorkflowRunView } from "./ui-contract.js";
+import type {
+  FactoryView,
+  WorkflowCallView,
+  WorkflowRunView,
+} from "./ui-contract.js";
 
 type RunLoadState =
   | { status: "loading" }
@@ -59,6 +63,7 @@ interface SharedWorkflowView {
 }
 
 const ACTIVE_POLL_INTERVAL_MS = 1_000;
+const FACTORY_PROMPT_PREFIX = "Use BB Factory for this request:\n\n";
 const WORKFLOW_PANEL_ACTION_ID = "workflow-run";
 const WORKFLOW_CARD_ROW_HEIGHT = 32;
 const WORKFLOW_HEADER_GROUP_CLASS = activityRowClass(
@@ -483,6 +488,213 @@ function RefreshWarning({ message }: { message: string }) {
     >
       Could not refresh: {message}. Retrying…
     </div>
+  );
+}
+
+function FactoryStatusBanner() {
+  const view = useComposerView();
+  if (view.scope.kind !== "thread") return null;
+  return <FactoryStatusBannerLoaded threadId={view.scope.threadId} />;
+}
+
+function FactoryBriefSummary({ factory }: { factory: FactoryView }) {
+  const brief = factory.brief;
+  if (brief === null) {
+    return <p className="text-xs text-foreground/90">{factory.request}</p>;
+  }
+  const sections = [
+    ["Acceptance", brief.acceptanceCriteria],
+    ["Constraints", brief.constraints],
+    ["Non-goals", brief.nonGoals],
+    ["Evidence", brief.evidence],
+  ] as const;
+  return (
+    <div className="space-y-2 text-xs text-foreground/90">
+      <p>{brief.outcome}</p>
+      <p>
+        <span className="font-medium text-foreground">Journey:</span>{" "}
+        {brief.userJourney}
+      </p>
+      {sections.map(([label, items]) =>
+        items.length === 0 ? null : (
+          <div key={label}>
+            <p className="font-medium text-foreground">{label}</p>
+            <ul className="list-disc space-y-0.5 pl-4">
+              {items.map((item) => (
+                <li key={item}>{item}</li>
+              ))}
+            </ul>
+          </div>
+        ),
+      )}
+    </div>
+  );
+}
+
+function FactoryStatusBannerLoaded({ threadId }: { threadId: string }) {
+  const rpc = useRpc<typeof workflowUiRpcContract>();
+  const navigate = useBbNavigate();
+  const [factory, setFactory] = useState<FactoryView | null>(null);
+  const [pending, setPending] = useState<"approve" | "cancel" | "close" | null>(
+    null,
+  );
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timeout: number | null = null;
+    const refresh = async () => {
+      try {
+        const result = await rpc.call("factoryOpenForThread", { threadId });
+        if (!cancelled) setFactory(result.factory);
+      } catch {
+        // The next poll repairs transient connection failures.
+      }
+    };
+    const schedule = () => {
+      timeout = window.setTimeout(() => {
+        void refresh().finally(() => {
+          if (!cancelled) schedule();
+        });
+      }, ACTIVE_POLL_INTERVAL_MS);
+    };
+    void refresh().finally(schedule);
+    return () => {
+      cancelled = true;
+      if (timeout !== null) window.clearTimeout(timeout);
+    };
+  }, [rpc, threadId]);
+
+  if (factory === null) return null;
+  const isActive = [
+    "shaping",
+    "awaiting_approval",
+    "launching",
+    "running",
+  ].includes(factory.status);
+  const statusText =
+    factory.status === "shaping"
+      ? "Shaping request"
+      : factory.status === "awaiting_approval"
+        ? "Shape ready for approval"
+        : factory.status === "launching" || factory.status === "running"
+          ? "Building candidate"
+          : factory.status === "candidate"
+            ? "Candidate ready"
+            : factory.status === "failed"
+              ? "Factory failed"
+              : factory.status === "cancelled"
+                ? "Factory cancelled"
+                : "Factory closed";
+
+  const act = async (action: "approve" | "cancel" | "close") => {
+    setPending(action);
+    setActionError(null);
+    try {
+      const result =
+        action === "approve"
+          ? await rpc.call("factoryApprove", {
+              threadId,
+              factoryId: factory.id,
+            })
+          : action === "cancel"
+            ? await rpc.call("factoryCancel", {
+                threadId,
+                factoryId: factory.id,
+              })
+            : await rpc.call("factoryClose", {
+                threadId,
+                factoryId: factory.id,
+              });
+      setFactory(result.factory.status === "closed" ? null : result.factory);
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPending(null);
+    }
+  };
+
+  return (
+    <section
+      aria-label="Factory"
+      className="overflow-hidden rounded-lg border border-border bg-surface-raised-solid"
+    >
+      <div className="flex min-h-8 items-center gap-2 px-3 py-1.5">
+        <Icon
+          name="Workflow"
+          className={activityIconClass(
+            isActive ? "active" : "completed",
+            "size-3.5",
+          )}
+          aria-hidden
+        />
+        <span
+          className={activityTextClass(
+            isActive ? "active" : "completed",
+            "min-w-0 flex-1 truncate text-xs",
+          )}
+        >
+          Factory · {statusText}
+        </span>
+        {factory.workflowRunId === null ? null : (
+          <button
+            type="button"
+            aria-label="Open Factory workflow"
+            className="text-xs text-muted-foreground hover:text-foreground"
+            onClick={() =>
+              navigate.openThreadPanel({
+                actionId: WORKFLOW_PANEL_ACTION_ID,
+                title: "Factory",
+                params: { runId: factory.workflowRunId },
+              })
+            }
+          >
+            Open
+          </button>
+        )}
+      </div>
+      <div className="space-y-2 border-t border-border px-3 py-2.5">
+        <FactoryBriefSummary factory={factory} />
+        {factory.error === null && actionError === null ? null : (
+          <p className="text-xs text-destructive-text">
+            {actionError ?? factory.error}
+          </p>
+        )}
+        <div className="flex items-center justify-end gap-2">
+          {factory.status === "awaiting_approval" ? (
+            <Button
+              type="button"
+              size="sm"
+              disabled={pending !== null}
+              onClick={() => void act("approve")}
+            >
+              {pending === "approve" ? "Approving…" : "Approve and run"}
+            </Button>
+          ) : null}
+          {isActive ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={pending !== null}
+              onClick={() => void act("cancel")}
+            >
+              {pending === "cancel" ? "Stopping…" : "Cancel"}
+            </Button>
+          ) : factory.status === "closed" ? null : (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={pending !== null}
+              onClick={() => void act("close")}
+            >
+              {pending === "close" ? "Closing…" : "Dismiss"}
+            </Button>
+          )}
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -970,9 +1182,35 @@ function WorkflowRunPanelLoaded({
 
 export default definePluginApp((app) => {
   app.composer.customize({
+    id: "factory-entry",
+    scopes: ["thread", "new-thread"],
+    plusMenu: [
+      {
+        id: "factory",
+        label: "Factory",
+        icon: "Workflow",
+        description: "Shape, approve, build, and verify a complete candidate",
+        run({ composer }) {
+          const current = composer.text.trim();
+          composer.setText(
+            current.startsWith(FACTORY_PROMPT_PREFIX.trim())
+              ? composer.text
+              : `${FACTORY_PROMPT_PREFIX}${current}`,
+          );
+          composer.focus();
+        },
+      },
+    ],
+  });
+  app.composer.customize({
     id: "workflow-status",
     scopes: ["thread"],
     banners: [
+      {
+        id: "factory-engagement",
+        chrome: "bare",
+        component: FactoryStatusBanner,
+      },
       { id: "active-runs", chrome: "bare", component: WorkflowStatusBanner },
     ],
   });

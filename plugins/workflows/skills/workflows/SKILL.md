@@ -1,9 +1,55 @@
 ---
 name: workflows
-description: Execute a workflow script that orchestrates multiple subagents deterministically. Use for multi-agent orchestration, parallel or sequential agent pipelines, structured outputs, and durable background workflow runs.
+description: Run BB Factory from vague request through explicit shape approval and independent acceptance, or execute deterministic multi-agent workflows with structured outputs and durable background runs.
 ---
 
 # BB workflows
+
+## Factory
+
+When the user explicitly asks for **BB Factory** or selects **Factory** in the
+composer, call `bb_factory_start` immediately with the user's original request.
+Do not replace their words with a specification first. The server creates one
+durable shaping engagement for that thread.
+
+During shaping:
+
+1. Inspect the real workspace, instructions, existing behavior, and available
+   evidence before asking questions.
+2. Resolve discoverable facts yourself.
+3. Infer ordinary implementation details when they do not change intent.
+4. Ask only one blocking owner decision at a time. Use `AskUserQuestion` when
+   available.
+5. Produce a concrete shape with an outcome, primary user journey, observable
+   acceptance criteria, constraints, non-goals, and evidence handles.
+6. Submit it through `bb_factory_propose`.
+
+A proposal does not authorize implementation. Tell the user that the shape is
+ready in the Factory card above the composer. Do not infer consent, call
+`bb_workflow_run`, edit code, or begin production while the engagement is
+`awaiting_approval`. The server launches the built-in Factory workflow only
+after the user selects **Approve and run** or invokes the explicit CLI approval
+command.
+
+The built-in workflow runs `Plan → Build → Verify`, permits one bounded
+`Revise → Acceptance` pass after a rejection, and returns both the builder's
+report and independent acceptance evidence. It inherits the origin thread's
+provider and execution settings, but lifecycle semantics are BB-owned and
+provider-independent. It does not commit, push, merge, or deploy. Treat a
+successful run as a candidate for user review, not external-action consent.
+
+Factory CLI equivalents:
+
+```bash
+bb workflows factory-start --request '<outcome>'
+bb workflows factory-propose <factory-id> --brief '<json>'
+bb workflows factory-status <factory-id>
+bb workflows factory-approve <factory-id>
+bb workflows factory-stop <factory-id>
+bb workflows factory-close <factory-id>
+```
+
+## Authored workflows
 
 A workflow structures work across many agents — to be comprehensive (decompose
 and cover in parallel), to be confident (independent perspectives and
@@ -477,6 +523,12 @@ bb workflows status <run-id>
 bb workflows history <run-id> --cursor 0 --limit 100
 bb workflows list --limit 20
 bb workflows stop <run-id>
+bb workflows factory-start --request '<outcome>'
+bb workflows factory-propose <factory-id> --brief '<json>'
+bb workflows factory-status <factory-id>
+bb workflows factory-approve <factory-id>
+bb workflows factory-stop <factory-id>
+bb workflows factory-close <factory-id>
 bb provider list --environment "$BB_ENVIRONMENT_ID" --json
 bb provider models <provider-id> --environment "$BB_ENVIRONMENT_ID" --json
 ```

@@ -3,13 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Run durable, provider-independent agent workflows.",
+  "description": "Shape approved candidates and run durable, provider-independent agent workflows.",
   "engines": {
     "bb": ">=0.0"
   },
   "bb": {
     "name": "Workflows",
-    "description": "Run durable, provider-independent agent workflows.",
+    "description": "Shape approved candidates and run durable, provider-independent agent workflows.",
     "branding": {
       "icon": "Workflow"
     },

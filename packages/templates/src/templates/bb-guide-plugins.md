@@ -22,8 +22,10 @@ The builtin Custom instructions plugin adds a multiline editor under Settings
 agent task instructions; blank text contributes nothing.
 
 The builtin Workflows plugin runs durable provider-independent JavaScript
-orchestration. It is disabled on fresh installations; enable `workflows` under
-Extensions → Plugins or run `bb plugin enable workflows` before using:
+orchestration and the native Factory lifecycle from shaped request through
+explicit approval and independent acceptance. It is disabled on fresh
+installations; enable `workflows` under Extensions → Plugins or run
+`bb plugin enable workflows` before using:
 
   bb workflows validate (--script '<javascript>'|--source '<javascript>'|
                         --file <path>|--name <name>)
@@ -34,6 +36,19 @@ Extensions → Plugins or run `bb plugin enable workflows` before using:
   bb workflows history <run-id> [--cursor <call-index>] [--limit <1-100>]
   bb workflows list [--limit <1-50>]
   bb workflows stop <run-id>
+  bb workflows factory-start --request '<outcome>'
+  bb workflows factory-propose <factory-id> --brief '<json>'
+  bb workflows factory-status <factory-id>
+  bb workflows factory-approve <factory-id>
+  bb workflows factory-stop <factory-id>
+  bb workflows factory-close <factory-id>
+
+Select **Factory** from the composer `+` menu to prime a request. The origin
+agent creates a durable shaping engagement, investigates discoverable facts,
+and submits a structured brief. No production workflow starts until the user
+selects **Approve and run** or invokes `factory-approve`. The built-in workflow
+runs Plan, Build, independent Verify, one bounded Revise when needed, and fresh
+Acceptance. It does not commit, push, merge, or deploy.
 
 Commands must run from a BB project thread. Workflows has six plugin
 settings, configurable with `bb plugin config workflows set <key> <value>`:

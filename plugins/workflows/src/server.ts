@@ -3,6 +3,7 @@ import { z } from "zod";
 import { registerWorkflowCli } from "./cli.js";
 import { migrations } from "./data.js";
 import { executeWorkflowScript } from "./runtime.js";
+import { createFactoryService, factoryBriefSchema } from "./factory.js";
 import { createWorkflowService } from "./service.js";
 import {
   DEFAULT_WORKFLOW_SETTINGS,
@@ -10,7 +11,7 @@ import {
 } from "./settings.js";
 import { prepareWorkflowSource } from "./workflow-input.js";
 import { workflowUiRpcContract } from "./ui-contract.js";
-import { buildWorkflowRunView } from "./ui-view.js";
+import { buildFactoryView, buildWorkflowRunView } from "./ui-view.js";
 
 // The named export lets the packaged-artifact smoke test execute the exact
 // runtime BB loads, including its embedded QuickJS WASM.
@@ -63,6 +64,24 @@ const runInputSchema = z
       .default(null),
   })
   .strict();
+const factoryStartInputSchema = z
+  .object({
+    request: z
+      .string()
+      .trim()
+      .min(1)
+      .max(4_000)
+      .describe(
+        "The user's original outcome request. Preserve their words; do not replace it with your interpretation.",
+      ),
+  })
+  .strict();
+const factoryProposeInputSchema = z
+  .object({
+    factoryId: z.string().trim().min(1),
+    brief: factoryBriefSchema,
+  })
+  .strict();
 const resultInputSchema = z
   .object({
     value: z
@@ -92,6 +111,7 @@ export default async function plugin(bb: BbPluginApi) {
     );
   }
   const service = createWorkflowService(bb, db, initialSettings);
+  const factory = createFactoryService(db, service);
   settings.onChange(
     (next) => service.updateSettings(next),
     (error) =>
@@ -99,7 +119,7 @@ export default async function plugin(bb: BbPluginApi) {
         `Workflow settings are invalid; the last valid values remain active: ${error.message}`,
       ),
   );
-  registerWorkflowCli(bb, service);
+  registerWorkflowCli(bb, service, factory);
 
   function workflowForThread(threadId: string, runId: string | null) {
     const run =
@@ -114,6 +134,27 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   bb.rpc.register(workflowUiRpcContract, {
+    factoryOpenForThread({ threadId }) {
+      const engagement = factory.inspectOpenForThread(threadId);
+      return {
+        factory: engagement === null ? null : buildFactoryView(engagement),
+      };
+    },
+    async factoryApprove({ threadId, factoryId }) {
+      return {
+        factory: buildFactoryView(await factory.approve(factoryId, threadId)),
+      };
+    },
+    async factoryCancel({ threadId, factoryId }) {
+      return {
+        factory: buildFactoryView(await factory.cancel(factoryId, threadId)),
+      };
+    },
+    factoryClose({ threadId, factoryId }) {
+      return {
+        factory: buildFactoryView(factory.close(factoryId, threadId)),
+      };
+    },
     workflowActiveRuns({ threadId }) {
       return {
         runs: service
@@ -132,6 +173,70 @@ export default async function plugin(bb: BbPluginApi) {
       const latest = workflowForThread(threadId, run.id);
       if (latest === null) throw new Error(`Unknown workflow run ${runId}`);
       return { stopped, run: buildWorkflowRunView(latest) };
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "bb_factory_start",
+    description:
+      "Start a durable BB Factory shaping engagement for a vague or substantial product request. Call this before researching or refining the request. The Factory does not write code until a structured shape is proposed with bb_factory_propose and the user explicitly approves it in BB. After starting, inspect the real workspace and ask only blocking owner questions. Do not call bb_workflow_run for the same request.",
+    parameters: factoryStartInputSchema,
+    async execute({ request }, ctx) {
+      try {
+        const current = factory.inspectOpenForThread(ctx.threadId);
+        if (
+          current !== null &&
+          ["shaping", "awaiting_approval", "launching", "running"].includes(
+            current.status,
+          )
+        ) {
+          return jsonResult({
+            factoryId: current.id,
+            status: current.status,
+            resumed: true,
+            request: current.request,
+            next:
+              current.status === "shaping"
+                ? "Continue shaping this engagement, then call bb_factory_propose."
+                : "The existing Factory engagement already has a proposed or approved shape. Do not start another one.",
+          });
+        }
+        const engagement = factory.start({
+          projectId: ctx.projectId,
+          originThreadId: ctx.threadId,
+          request,
+        });
+        return jsonResult({
+          factoryId: engagement.id,
+          status: engagement.status,
+          next: "Inspect the workspace, make unknown facts concrete, and ask only decisions that materially change the result. Then call bb_factory_propose with the complete shape. The user approves from the Factory card.",
+        });
+      } catch (error) {
+        return errorResult(
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "bb_factory_propose",
+    description:
+      "Freeze a concrete Factory shape after investigating the workspace and resolving blocking owner decisions. This only submits the proposal for user approval; it cannot launch production. Every acceptance criterion must be observable. Evidence must name inspected files, behavior, or sources rather than confidence claims.",
+    parameters: factoryProposeInputSchema,
+    async execute({ factoryId, brief }, ctx) {
+      try {
+        const engagement = factory.propose(factoryId, ctx.threadId, brief);
+        return jsonResult({
+          factoryId: engagement.id,
+          status: engagement.status,
+          next: "Tell the user the Factory shape is ready in the card above the composer. Do not begin implementation or claim approval.",
+        });
+      } catch (error) {
+        return errorResult(
+          error instanceof Error ? error.message : String(error),
+        );
+      }
     },
   });
 
@@ -205,10 +310,10 @@ export default async function plugin(bb: BbPluginApi) {
       };
     }
     return {
-      tools: ["bb_workflow_run"],
+      tools: ["bb_factory_start", "bb_factory_propose", "bb_workflow_run"],
       skills: ["workflows"],
       instructions:
-        "When bb_workflow_run succeeds, copy its previewDirective into your response exactly once as a standalone line. Do not wrap it in backticks or a code fence, and do not invent or edit the run ID. The directive renders live workflow progress in BB chat. `bb workflows status <run-id>` returns a compact summary. For detailed history, redirect `bb workflows history <run-id> --cursor <call-index> --limit <1-100>` into a file under `$BB_THREAD_STORAGE`, then inspect that JSONL file with normal filesystem tools. Use each page record's `nextCursor` to continue.",
+        "When the user explicitly asks for BB Factory or selects Factory in the composer, call bb_factory_start with their original request before doing shaping work. Investigate discoverable facts yourself. Ask the user only for blocking owner decisions. Once the desired outcome, user journey, boundaries, and observable acceptance criteria are concrete, call bb_factory_propose. Never infer approval or start implementation while Factory is awaiting approval; the server-owned Factory card is the approval gate. For ordinary workflows, when bb_workflow_run succeeds, copy its previewDirective into your response exactly once as a standalone line. Do not wrap it in backticks or a code fence, and do not invent or edit the run ID. The directive renders live workflow progress in BB chat. `bb workflows status <run-id>` returns a compact summary. For detailed history, redirect `bb workflows history <run-id> --cursor <call-index> --limit <1-100>` into a file under `$BB_THREAD_STORAGE`, then inspect that JSONL file with normal filesystem tools. Use each page record's `nextCursor` to continue.",
     };
   });
 

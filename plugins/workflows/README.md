@@ -1,5 +1,7 @@
 # Workflows built-in plugin
 
+> Diátaxis: reference
+
 Workflows is an opt-in built-in plugin (`builtin:workflows`) and is disabled on
 fresh BB installations. It runs provider-independent JavaScript orchestration
 inside QuickJS while delegating actual reasoning to ordinary BB threads.
@@ -10,6 +12,36 @@ The author-facing native surface is intentionally one tool:
 built-in `bb provider` commands. Structured workers separately
 receive only `bb_workflow_result`; ordinary authoring agents never receive that
 worker tool.
+
+## Factory
+
+Factory is the plugin's native path from a vague request to an approved,
+independently reviewed candidate. Select **Factory** from the chat composer's
+`+` menu. BB primes the draft for the origin agent to create a durable shaping
+engagement with `bb_factory_start`. The origin agent investigates discoverable
+facts and asks only blocking owner questions. It then submits a frozen shape
+with `bb_factory_propose`.
+
+The server, not the model, owns the approval transition. No production workflow
+exists until the user selects **Approve and run** in the composer card or uses
+the matching CLI command. Approval launches the built-in provider-independent
+`Plan → Build → Verify → Revise → Acceptance` workflow with the origin thread's
+provider, model, reasoning level, permission mode, environment, and workspace.
+A rejected first review gets one bounded revision and fresh acceptance pass.
+The workflow fails if acceptance still rejects the candidate. It does not
+commit, push, merge, or deploy.
+
+Factory states are durable:
+
+```text
+shaping → awaiting_approval → launching → running
+                                      → candidate | failed | cancelled
+                                      → closed
+```
+
+The Factory record owns only the product lifecycle, frozen brief, approval, and
+linked workflow ID. Existing Workflow rows remain the sole owner of worker
+calls, replay, retries, cancellation, results, and traces.
 
 ## Progress UI
 
@@ -165,6 +197,12 @@ bb workflows status <run-id>
 bb workflows history <run-id> --cursor 0 --limit 100
 bb workflows list --limit 20
 bb workflows stop <run-id>
+bb workflows factory-start --request '<outcome>'
+bb workflows factory-propose <factory-id> --brief '<json>'
+bb workflows factory-status <factory-id>
+bb workflows factory-approve <factory-id>
+bb workflows factory-stop <factory-id>
+bb workflows factory-close <factory-id>
 bb provider list --environment "$BB_ENVIRONMENT_ID" --json
 bb provider models <provider-id> --environment "$BB_ENVIRONMENT_ID" --json
 ```

@@ -2,7 +2,7 @@
 import { act, cleanup, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadPluginApp, renderSlot } from "@bb/plugin-sdk/testing/app";
-import type { WorkflowRunView } from "./ui-contract.js";
+import type { FactoryView, WorkflowRunView } from "./ui-contract.js";
 
 const app = await loadPluginApp(() => import("./app"));
 
@@ -16,6 +16,25 @@ const message = {
   threadId: "thr_origin",
   turnId: "turn_1",
   projectId: "proj_1",
+};
+
+const factory: FactoryView = {
+  id: "fac_11111111-1111-4111-8111-111111111111",
+  request: "Make onboarding useful",
+  status: "awaiting_approval",
+  brief: {
+    outcome: "A new user reaches useful value without setup confusion.",
+    userJourney: "Create an account and complete the first useful action.",
+    acceptanceCriteria: ["The primary journey works end to end"],
+    constraints: ["Preserve existing accounts"],
+    nonGoals: ["Redesign settings"],
+    evidence: ["Inspected the current onboarding route"],
+  },
+  workflowRunId: null,
+  error: null,
+  createdAt: 800,
+  updatedAt: 900,
+  approvedAt: null,
 };
 
 const run: WorkflowRunView = {
@@ -83,12 +102,20 @@ const run: WorkflowRunView = {
 };
 
 describe("workflows app registration", () => {
-  it("registers the composer banner, chat directive, and thread panel action", () => {
+  it("registers Factory in the plus menu beside the durable composer surfaces", () => {
     expect(app.composerCustomizations).toMatchObject([
+      {
+        id: "factory-entry",
+        scopes: ["thread", "new-thread"],
+        plusMenu: [{ id: "factory", label: "Factory", icon: "Workflow" }],
+      },
       {
         id: "workflow-status",
         scopes: ["thread"],
-        banners: [{ id: "active-runs", chrome: "bare" }],
+        banners: [
+          { id: "factory-engagement", chrome: "bare" },
+          { id: "active-runs", chrome: "bare" },
+        ],
       },
     ]);
     expect(app.messageDirectives.map((directive) => directive.id)).toEqual([
@@ -98,10 +125,82 @@ describe("workflows app registration", () => {
       { id: "workflow-run", title: "Workflow run", icon: "Workflow" },
     ]);
   });
+
+  it("primes the current draft for Factory shaping without submitting it", async () => {
+    const item = app.composerCustomizations[0]!.plusMenu![0]!;
+    const setText = vi.fn();
+    const focus = vi.fn();
+    await item.run({
+      composer: {
+        scope: { kind: "thread", threadId: "thr_origin" },
+        text: "Improve onboarding",
+        setText,
+        updateText: vi.fn(),
+        clear: vi.fn(),
+        setTextEffect: vi.fn(),
+        setInputLock: vi.fn(),
+        setThreadRowStatus: vi.fn(),
+        addQuote: vi.fn(),
+        insertMention: vi.fn(),
+        focus,
+      },
+      view: {
+        scope: { kind: "thread", threadId: "thr_origin" },
+        layout: "expanded",
+        draft: {
+          text: "Improve onboarding",
+          isEmpty: false,
+          attachmentCount: 0,
+        },
+        run: { isRunning: false, isSubmitting: false },
+      },
+    });
+    expect(setText).toHaveBeenCalledWith(
+      "Use BB Factory for this request:\n\nImprove onboarding",
+    );
+    expect(focus).toHaveBeenCalled();
+  });
+});
+
+describe("Factory composer banner", () => {
+  const banner = app.composerCustomizations[1]!.banners![0]!;
+
+  it("shows the frozen shape and launches only from explicit approval", async () => {
+    const slot = renderSlot(
+      banner,
+      {},
+      {
+        composer: { scope: { kind: "thread", threadId: "thr_scope" } },
+        rpc: {
+          factoryOpenForThread: () => ({ factory }),
+          factoryApprove: () => ({
+            factory: {
+              ...factory,
+              status: "running",
+              workflowRunId: run.id,
+              approvedAt: 1_000,
+            },
+          }),
+        },
+      },
+    );
+
+    expect(await slot.findByText(factory.brief!.outcome)).toBeTruthy();
+    expect(slot.getByText(factory.brief!.userJourney)).toBeTruthy();
+    expect(slot.getByText(factory.brief!.acceptanceCriteria[0]!)).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: /approve and run/i }));
+    await waitFor(() =>
+      expect(slot.rpcCalls).toContainEqual({
+        method: "factoryApprove",
+        input: { threadId: "thr_scope", factoryId: factory.id },
+      }),
+    );
+    expect(await slot.findByText(/building candidate/i)).toBeTruthy();
+  });
 });
 
 describe("workflow composer banner", () => {
-  const banner = app.composerCustomizations[0]!.banners![0]!;
+  const banner = app.composerCustomizations[1]!.banners![1]!;
 
   it("renders active runs for the composer scope thread", async () => {
     const queuedRun: WorkflowRunView = {

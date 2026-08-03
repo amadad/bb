@@ -500,9 +500,9 @@ add <key-or-comment-id> --file <path>` (task key = task-level; comment ID
 ## Workflows
 
 - The builtin `workflows` plugin runs durable provider-independent JavaScript
-  orchestration and is disabled on fresh installations. Enable it under
-  Extensions → Plugins or with `bb plugin enable workflows` before using its
-  command.
+  orchestration and the BB Factory lifecycle. It is disabled on fresh
+  installations. Enable it under Extensions → Plugins or with
+  `bb plugin enable workflows` before using its command.
 - Author and check sources with `bb workflows validate (--script <javascript>|
 --source <javascript>|--file <path>|--name <name>)`; start a background run
   with the same selector via `bb workflows run ... [--args <json>] [--resume
@@ -515,6 +515,14 @@ add <key-or-comment-id> --file <path>` (task key = task-level; comment ID
   from the final page record's `nextCursor`. This shell redirection writes on
   the thread's execution host, including remote hosts; do not print the raw
   history into the agent transcript. Cancel with `bb workflows stop <run-id>`.
+- Factory turns an investigated shape into an explicitly approved candidate.
+  Use `bb workflows factory-start --request <outcome>`, then
+  `factory-propose <factory-id> --brief <json>`. Inspect with `factory-status`.
+  Only `factory-approve <factory-id>` may launch production. Use
+  `factory-stop` to cancel and `factory-close` to dismiss a terminal
+  engagement. The built-in run performs Plan, Build, independent Verify, one
+  bounded Revise when needed, and fresh Acceptance. It does not commit, push,
+  merge, or deploy.
 - Before choosing an explicit provider/model/reasoning tuple, run `bb provider
 list --environment "$BB_ENVIRONMENT_ID" --json`, then query only the chosen
   provider with `bb provider models <provider-id> --environment

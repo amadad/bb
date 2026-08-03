@@ -3,6 +3,11 @@ import type {
   PluginCliContext,
   PluginCliResult,
 } from "@bb/plugin-sdk";
+import {
+  factoryBriefSchema,
+  type FactoryInspection,
+  type FactoryService,
+} from "./factory.js";
 import type { JsonValue } from "./types.js";
 import type {
   WorkflowCallInspection,
@@ -25,6 +30,23 @@ const MAX_LIST_LIMIT = 50;
 
 function success(value: unknown): PluginCliResult {
   return { exitCode: 0, stdout: `${JSON.stringify(value)}\n` };
+}
+
+function factoryCliView(factory: FactoryInspection) {
+  return {
+    id: factory.id,
+    projectId: factory.projectId,
+    originThreadId: factory.originThreadId,
+    request: factory.request,
+    brief: factory.brief,
+    status: factory.status,
+    workflowRunId: factory.workflowRunId,
+    error: factory.error,
+    createdAt: factory.createdAt,
+    updatedAt: factory.updatedAt,
+    approvedAt: factory.approvedAt,
+    closedAt: factory.closedAt,
+  };
 }
 
 function jsonLines(records: readonly unknown[]): PluginCliResult {
@@ -349,6 +371,7 @@ function callLogRecord(call: WorkflowCallInspection, exportedAt: number) {
 export function registerWorkflowCli(
   bb: BbPluginApi,
   service: WorkflowService,
+  factory: FactoryService,
 ): void {
   bb.cli.register({
     name: "workflows",
@@ -386,6 +409,36 @@ export function registerWorkflowCli(
         name: "stop",
         summary: "Cancel a workflow run",
         usage: "bb workflows stop <run-id>",
+      },
+      {
+        name: "factory-start",
+        summary: "Start shaping a Factory engagement",
+        usage: "bb workflows factory-start --request '<outcome>'",
+      },
+      {
+        name: "factory-propose",
+        summary: "Submit a Factory shape for approval",
+        usage: "bb workflows factory-propose <factory-id> --brief '<json>'",
+      },
+      {
+        name: "factory-status",
+        summary: "Inspect a Factory engagement",
+        usage: "bb workflows factory-status <factory-id>",
+      },
+      {
+        name: "factory-approve",
+        summary: "Approve a frozen Factory shape and launch production",
+        usage: "bb workflows factory-approve <factory-id>",
+      },
+      {
+        name: "factory-stop",
+        summary: "Cancel an active Factory engagement",
+        usage: "bb workflows factory-stop <factory-id>",
+      },
+      {
+        name: "factory-close",
+        summary: "Dismiss a terminal Factory engagement",
+        usage: "bb workflows factory-close <factory-id>",
       },
     ],
     async run(argv, ctx) {
@@ -516,8 +569,103 @@ export function registerWorkflowCli(
           }
           return success({ runId, stopped: await service.stop(runId) });
         }
+        if (command === "factory-start") {
+          const { options } = parseArguments(argv.slice(1), ["--request"]);
+          const context = requireContext(ctx);
+          const request = options.get("--request");
+          if (request === undefined) throw new Error("--request is required");
+          return success(
+            factoryCliView(
+              factory.start({
+                projectId: context.projectId,
+                originThreadId: context.threadId,
+                request,
+              }),
+            ),
+          );
+        }
+        if (command === "factory-propose") {
+          const { options, positionals } = parseArguments(
+            argv.slice(1),
+            ["--brief"],
+            "factory-propose",
+          );
+          const context = requireContext(ctx);
+          const rawBrief = options.get("--brief");
+          if (rawBrief === undefined) throw new Error("--brief is required");
+          let parsedBrief: unknown;
+          try {
+            parsedBrief = JSON.parse(rawBrief);
+          } catch (error) {
+            throw new Error(
+              `--brief must be valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          return success(
+            factoryCliView(
+              factory.propose(
+                positionals[0]!,
+                context.threadId,
+                factoryBriefSchema.parse(parsedBrief),
+              ),
+            ),
+          );
+        }
+        if (command === "factory-status") {
+          const { positionals } = parseArguments(
+            argv.slice(1),
+            [],
+            "factory-status",
+          );
+          const context = requireContext(ctx);
+          const engagement = factory.inspect(positionals[0]!);
+          if (
+            engagement === null ||
+            engagement.projectId !== context.projectId
+          ) {
+            throw new Error(`Unknown Factory engagement ${positionals[0]}`);
+          }
+          return success(factoryCliView(engagement));
+        }
+        if (command === "factory-approve") {
+          const { positionals } = parseArguments(
+            argv.slice(1),
+            [],
+            "factory-approve",
+          );
+          const context = requireContext(ctx);
+          return success(
+            factoryCliView(
+              await factory.approve(positionals[0]!, context.threadId),
+            ),
+          );
+        }
+        if (command === "factory-stop") {
+          const { positionals } = parseArguments(
+            argv.slice(1),
+            [],
+            "factory-stop",
+          );
+          const context = requireContext(ctx);
+          return success(
+            factoryCliView(
+              await factory.cancel(positionals[0]!, context.threadId),
+            ),
+          );
+        }
+        if (command === "factory-close") {
+          const { positionals } = parseArguments(
+            argv.slice(1),
+            [],
+            "factory-close",
+          );
+          const context = requireContext(ctx);
+          return success(
+            factoryCliView(factory.close(positionals[0]!, context.threadId)),
+          );
+        }
         return failure(
-          "Usage: bb workflows <run|validate|status|history|list|stop> [options]",
+          "Usage: bb workflows <run|validate|status|history|list|stop|factory-start|factory-propose|factory-status|factory-approve|factory-stop|factory-close> [options]",
         );
       } catch (error) {
         return failure(error instanceof Error ? error.message : String(error));

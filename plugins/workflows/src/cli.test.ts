@@ -147,14 +147,29 @@ describe("workflows CLI argument validation", () => {
     });
   });
 
-  it("keeps one author tool and the shared Claude workflow language", async () => {
+  it("exposes Factory and the shared workflow language to every author", async () => {
     expect(harness.registrations.agentTools.map((tool) => tool.name)).toEqual([
+      "bb_factory_start",
+      "bb_factory_propose",
       "bb_workflow_run",
       "bb_workflow_result",
     ]);
     expect(
       harness.registrations.cli?.commands.map((command) => command.name),
-    ).toEqual(["run", "validate", "status", "history", "list", "stop"]);
+    ).toEqual([
+      "run",
+      "validate",
+      "status",
+      "history",
+      "list",
+      "stop",
+      "factory-start",
+      "factory-propose",
+      "factory-status",
+      "factory-approve",
+      "factory-stop",
+      "factory-close",
+    ]);
     const run = harness.registrations.agentTools.find(
       (tool) => tool.name === "bb_workflow_run",
     );
@@ -207,8 +222,47 @@ describe("workflows CLI argument validation", () => {
       sideChat: false,
       origin: { kind: null, pluginId: null },
     });
-    expect(author.tools.map((tool) => tool.name)).toEqual(["bb_workflow_run"]);
+    expect(author.tools.map((tool) => tool.name)).toEqual([
+      "bb_factory_start",
+      "bb_factory_propose",
+      "bb_workflow_run",
+    ]);
     expect(author.skills).toEqual(["workflows"]);
+  });
+
+  it("starts, proposes, and inspects Factory state through the CLI", async () => {
+    const context = { threadId: "thread-test", projectId: "project-test" };
+    const started = await harness.runCli(
+      ["factory-start", "--request", "Make onboarding useful"],
+      context,
+    );
+    expect(started.exitCode).toBe(0);
+    const factoryId = (JSON.parse(started.stdout ?? "{}") as { id: string }).id;
+    const brief = {
+      outcome: "A useful first run",
+      userJourney: "Complete the first valuable action",
+      acceptanceCriteria: ["The primary journey works end to end"],
+      constraints: [],
+      nonGoals: [],
+      evidence: ["Inspected the onboarding route"],
+    };
+    await expect(
+      harness.runCli(
+        ["factory-propose", factoryId, "--brief", JSON.stringify(brief)],
+        context,
+      ),
+    ).resolves.toMatchObject({ exitCode: 0 });
+    const status = await harness.runCli(["factory-status", factoryId], context);
+    const inspected = JSON.parse(status.stdout ?? "{}") as Record<
+      string,
+      unknown
+    >;
+    expect(inspected).toMatchObject({
+      id: factoryId,
+      status: "awaiting_approval",
+      brief,
+    });
+    expect(inspected).not.toHaveProperty("briefJson");
   });
 
   it("keeps the removed workflow-specific catalog command out of project documentation", () => {
@@ -224,6 +278,22 @@ describe("workflows CLI argument validation", () => {
 
 describe("workflows agent-tool boundary schemas", () => {
   it.each([
+    ["bb_factory_start", { request: "Build it", extra: true }],
+    [
+      "bb_factory_propose",
+      {
+        factoryId: "fac_test",
+        brief: {
+          outcome: "Outcome",
+          userJourney: "Journey",
+          acceptanceCriteria: ["Criterion"],
+          constraints: [],
+          nonGoals: [],
+          evidence: [],
+        },
+        extra: true,
+      },
+    ],
     ["bb_workflow_run", { script: "return null", extra: true }],
     ["bb_workflow_result", { value: null, extra: true }],
   ])("rejects extra fields for %s", async (tool, input) => {

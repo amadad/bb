@@ -1,12 +1,28 @@
+import type { FactoryInspection } from "./factory.js";
 import { parseWorkflowSource } from "./parser.js";
 import type { WorkflowRunInspection } from "./service.js";
 import type {
+  FactoryView,
   WorkflowCallView,
   WorkflowPhaseView,
   WorkflowRunView,
 } from "./ui-contract.js";
 
 const MAX_FALLBACK_LABEL_LENGTH = 80;
+
+export function buildFactoryView(factory: FactoryInspection): FactoryView {
+  return {
+    id: factory.id,
+    request: factory.request,
+    status: factory.status,
+    brief: factory.brief,
+    workflowRunId: factory.workflowRunId,
+    error: factory.error,
+    createdAt: factory.createdAt,
+    updatedAt: factory.updatedAt,
+    approvedAt: factory.approvedAt,
+  };
+}
 
 function fallbackCallLabel(prompt: string, index: number): string {
   const normalized = prompt.replace(/\s+/g, " ").trim();
