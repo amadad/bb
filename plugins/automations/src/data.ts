@@ -150,7 +150,6 @@ export const migrations = [
      run_id TEXT NOT NULL,
      created_at INTEGER NOT NULL
    );`,
-  `ALTER TABLE automation_runs ADD COLUMN terminal_token TEXT;`,
   `UPDATE automations
    SET execution = json_set(
      execution,
@@ -163,9 +162,35 @@ export const migrations = [
    WHERE run_mode = 'agent'
      AND json_extract(execution, '$.permissionMode') IN (
        'workspace-write',
-     'readonly'
+       'readonly'
      );`,
+  `ALTER TABLE automation_runs ADD COLUMN terminal_token TEXT;`,
 ];
+
+/**
+ * Repair only databases that ran the rejected migration ordering. The host
+ * records migration completion by array index. Such a database has index 2
+ * recorded (the old permission-mode update) but lacks terminal_token because
+ * the rejected ALTER was inserted at already-recorded index 1.
+ */
+export function repairRejectedTerminalTokenMigration(db: Db): boolean {
+  const rejectedIndexApplied =
+    db
+      .prepare("SELECT 1 FROM _bb_migrations WHERE id = 2")
+      .get() !== undefined;
+  if (!rejectedIndexApplied) return false;
+
+  const terminalTokenExists =
+    db
+      .prepare(
+        "SELECT 1 FROM pragma_table_info('automation_runs') WHERE name = 'terminal_token'",
+      )
+      .get() !== undefined;
+  if (terminalTokenExists) return false;
+
+  db.exec("ALTER TABLE automation_runs ADD COLUMN terminal_token TEXT");
+  return true;
+}
 
 const automationRunSelectColumns = `
   id, automation_id AS automationId, run_mode AS runMode,
@@ -637,29 +662,36 @@ export function closeAutomationRun(
   return db.transaction(() => {
     const existing = getAutomationRun(db, args.runId);
     if (!existing) return null;
-    db.prepare(
-       `UPDATE automation_runs SET
-         status = @status,
-         skip_reason = @skipReason,
-         error = @error,
-         output = @output,
-         exit_code = @exitCode,
-         terminal_token = @terminalToken,
-         thread_id = CASE WHEN @hasThreadId THEN @threadId ELSE thread_id END,
-         finished_at = @now
-       WHERE id = @runId`,
-    ).run({
-      runId: args.runId,
-      status: args.status,
-      skipReason: args.skipReason ?? null,
-      error: args.error ?? null,
-      output: args.output ?? null,
-      exitCode: args.exitCode ?? null,
-      terminalToken: args.terminalToken ?? null,
-      hasThreadId: args.threadId === undefined ? 0 : 1,
-      threadId: args.threadId ?? null,
-      now: args.now,
-    });
+    const run = optionalRunRow(
+      db
+        .prepare(
+          `UPDATE automation_runs SET
+             status = @status,
+             skip_reason = @skipReason,
+             error = @error,
+             output = @output,
+             exit_code = @exitCode,
+             terminal_token = @terminalToken,
+             thread_id = CASE WHEN @hasThreadId THEN @threadId ELSE thread_id END,
+             finished_at = @now
+           WHERE id = @runId AND status = 'running'
+           RETURNING ${automationRunSelectColumns}`,
+        )
+        .get({
+          runId: args.runId,
+          status: args.status,
+          skipReason: args.skipReason ?? null,
+          error: args.error ?? null,
+          output: args.output ?? null,
+          exitCode: args.exitCode ?? null,
+          terminalToken:
+            args.status === "succeeded" ? (args.terminalToken ?? null) : null,
+          hasThreadId: args.threadId === undefined ? 0 : 1,
+          threadId: args.threadId ?? null,
+          now: args.now,
+        }),
+    );
+    if (!run) return { run: existing, automationId: existing.automationId };
     db.prepare(
       `UPDATE automations SET
          last_run_status = @status,
@@ -677,8 +709,6 @@ export function closeAutomationRun(
       error: args.error ?? null,
       now: args.now,
     });
-    const run = getAutomationRun(db, args.runId);
-    if (!run) return null;
     return { run, automationId: run.automationId };
   })();
 }

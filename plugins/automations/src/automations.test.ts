@@ -20,6 +20,7 @@ import {
   listAutomationsForProject,
   listAutomationRuns,
   migrations,
+  repairRejectedTerminalTokenMigration,
   restoreAutomationAfterFailedRun,
   type Db,
 } from "./data.js";
@@ -43,6 +44,28 @@ function createTestDb(includeRunMigration = true): Db {
   const db = new Database(":memory:");
   db.exec(includeRunMigration ? migrations.join("\n") : migrations[0] ?? "");
   return db;
+}
+
+function migrateByIndex(db: Db, statements: readonly string[]): void {
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS _bb_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)",
+  );
+  const applied = new Set(
+    db
+      .prepare<[], { id: number }>("SELECT id FROM _bb_migrations")
+      .all()
+      .map((row) => row.id),
+  );
+  const record = db.prepare(
+    "INSERT INTO _bb_migrations (id, applied_at) VALUES (?, ?)",
+  );
+  db.transaction(() => {
+    statements.forEach((statement, index) => {
+      if (applied.has(index)) return;
+      db.exec(statement);
+      record.run(index, 1);
+    });
+  })();
 }
 
 function createScheduledAutomation(
@@ -154,6 +177,67 @@ function createAutomationServiceBb() {
 }
 
 describe("data migrations", () => {
+  it("applies terminal_token on a fresh database at migration index 2", () => {
+    const db = new Database(":memory:");
+    migrateByIndex(db, migrations);
+
+    const columns = db
+      .prepare<[], { name: string }>(
+        "SELECT name FROM pragma_table_info('automation_runs')",
+      )
+      .all()
+      .map((row) => row.name);
+    expect(columns).toContain("terminal_token");
+    expect(
+      db
+        .prepare<[], { id: number }>(
+          "SELECT id FROM _bb_migrations ORDER BY id",
+        )
+        .all(),
+    ).toEqual([{ id: 0 }, { id: 1 }, { id: 2 }]);
+    expect(repairRejectedTerminalTokenMigration(db)).toBe(false);
+  });
+
+  it("repairs the exact parent-to-rejected upgrade without changing migration ids", () => {
+    const db = new Database(":memory:");
+    const parentMigrations = migrations.slice(0, 2);
+    const rejectedMigrations = [
+      migrations[0]!,
+      migrations[2]!,
+      migrations[1]!,
+    ];
+
+    migrateByIndex(db, parentMigrations);
+    migrateByIndex(db, rejectedMigrations);
+    expect(
+      db
+        .prepare<[], { name: string }>(
+          "SELECT name FROM pragma_table_info('automation_runs')",
+        )
+        .all()
+        .map((row) => row.name),
+    ).not.toContain("terminal_token");
+
+    migrateByIndex(db, migrations);
+    expect(repairRejectedTerminalTokenMigration(db)).toBe(true);
+    expect(
+      db
+        .prepare<[], { name: string }>(
+          "SELECT name FROM pragma_table_info('automation_runs')",
+        )
+        .all()
+        .map((row) => row.name),
+    ).toContain("terminal_token");
+    expect(
+      db
+        .prepare<[], { id: number }>(
+          "SELECT id FROM _bb_migrations ORDER BY id",
+        )
+        .all(),
+    ).toEqual([{ id: 0 }, { id: 1 }, { id: 2 }]);
+    expect(repairRejectedTerminalTokenMigration(db)).toBe(false);
+  });
+
   it("migrates stored agent automations to current permission modes", () => {
     const db = createTestDb(false);
     const insert = db.prepare(
@@ -449,6 +533,89 @@ describe("automation data access", () => {
     expect(closed?.status).toBe("skipped");
     expect(closed?.skipReason).toBe("empty output");
   });
+
+  it("keeps a finalized run unchanged when close is repeated", () => {
+    const db = createTestDb();
+    createScheduledAutomation(db, 1000);
+    const run = createManualRun(db, {
+      automationId: "auto_test",
+      runMode: "script",
+      now: 1000,
+    }).run;
+    const first = closeAutomationRun(db, {
+      runId: run.id,
+      status: "succeeded",
+      output: "TASK_COMPLETE",
+      exitCode: 0,
+      terminalToken: "TASK_COMPLETE",
+      now: 1001,
+    });
+    const second = closeAutomationRun(db, {
+      runId: run.id,
+      status: "failed",
+      error: "late failure",
+      output: "different output",
+      exitCode: 1,
+      terminalToken: "LATE_FAILURE",
+      now: 1002,
+    });
+
+    expect(first).not.toBeNull();
+    expect(second).toEqual(first);
+    expect(
+      listAutomationRuns(db, { automationId: "auto_test", limit: 1 })[0],
+    ).toEqual(first?.run);
+  });
+
+  it("never stores a domain token for failed, skipped, or running transport", () => {
+    const db = createTestDb();
+    createScheduledAutomation(db, 1000);
+    const failed = createManualRun(db, {
+      automationId: "auto_test",
+      runMode: "agent",
+      now: 1000,
+    }).run;
+    const skipped = createManualRun(db, {
+      automationId: "auto_test",
+      runMode: "script",
+      now: 1001,
+    }).run;
+
+    closeAutomationRun(db, {
+      runId: failed.id,
+      status: "failed",
+      error: "Agent transport failed",
+      output: "TASK_COMPLETE",
+      terminalToken: "TASK_COMPLETE",
+      now: 1002,
+    });
+    closeAutomationRun(db, {
+      runId: skipped.id,
+      status: "skipped",
+      skipReason: "cancelled",
+      output: "TASK_COMPLETE",
+      terminalToken: "TASK_COMPLETE",
+      now: 1003,
+    });
+
+    const runs = listAutomationRuns(db, {
+      automationId: "auto_test",
+      limit: 3,
+    });
+    expect(runs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: failed.id, terminalToken: null }),
+        expect.objectContaining({ id: skipped.id, terminalToken: null }),
+      ]),
+    );
+    expect(
+      createManualRun(db, {
+        automationId: "auto_test",
+        runMode: "agent",
+        now: 1004,
+      }).run.terminalToken,
+    ).toBeNull();
+  });
 });
 
 describe("automation service", () => {
@@ -738,9 +905,18 @@ describe("script wake gate", () => {
     expect(isWakeAgentSuppressed("not json\n")).toBe(false);
   });
 
-  it("extracts a bare terminal token from the last non-empty line", () => {
-    expect(extractTerminalToken("hello\nPULSE_FAILED\n")).toBe("PULSE_FAILED");
-    expect(extractTerminalToken("hello\nPULSE FAILED\n")).toBeNull();
+  it("extracts only a valid final physical non-whitespace token line", () => {
+    expect(extractTerminalToken("hello\rTASK_COMPLETE\r\n")).toBe(
+      "TASK_COMPLETE",
+    );
+    expect(extractTerminalToken("PULSE_OK\nnotes")).toBeNull();
+    expect(extractTerminalToken("TASK_COMPLETE\n```")).toBeNull();
+    expect(extractTerminalToken("TASK_COMPLETE\n{\"done\": true}")).toBeNull();
+    expect(extractTerminalToken("task_complete")).toBeNull();
+    expect(extractTerminalToken("TASK-COMPLETE")).toBeNull();
+    expect(extractTerminalToken("TASK_COMPLETE\u0000")).toBeNull();
+    expect(extractTerminalToken(`A${"_".repeat(128)}`)).toBeNull();
+    expect(extractTerminalToken("hello\nTASK COMPLETE\n")).toBeNull();
     expect(extractTerminalToken(null)).toBeNull();
   });
 
@@ -756,15 +932,30 @@ describe("script wake gate", () => {
       }),
     ).toMatchObject({ status: "skipped", skipReason: "wakeAgent false" });
     expect(
-      mapScriptResultToRun({ exitCode: 2, output: "bad", timedOut: false }),
-    ).toMatchObject({ status: "failed", error: "Script exited with code 2" });
+      mapScriptResultToRun({
+        exitCode: null,
+        output: "TASK_COMPLETE",
+        timedOut: true,
+      }),
+    ).toMatchObject({ status: "failed", terminalToken: null });
+    expect(
+      mapScriptResultToRun({
+        exitCode: 2,
+        output: "TASK_COMPLETE",
+        timedOut: false,
+      }),
+    ).toMatchObject({
+      status: "failed",
+      error: "Script exited with code 2",
+      terminalToken: null,
+    });
     expect(
       mapScriptResultToRun({
         exitCode: 0,
-        output: "done\nPULSE_FAILED\n",
+        output: "done\nTASK_COMPLETE\n",
         timedOut: false,
       }),
-    ).toMatchObject({ status: "succeeded", terminalToken: "PULSE_FAILED" });
+    ).toMatchObject({ status: "succeeded", terminalToken: "TASK_COMPLETE" });
   });
 });
 

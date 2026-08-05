@@ -76,7 +76,6 @@ export interface ScriptRunOutcome {
 }
 
 export function mapScriptResultToRun(result: ScriptRunResult): ScriptRunOutcome {
-  const terminalToken = extractTerminalToken(result.output);
   if (result.timedOut) {
     return {
       status: "failed",
@@ -84,7 +83,7 @@ export function mapScriptResultToRun(result: ScriptRunResult): ScriptRunOutcome 
       exitCode: null,
       error: "Script timed out",
       skipReason: null,
-      terminalToken,
+      terminalToken: null,
     };
   }
   if (result.exitCode !== 0) {
@@ -94,7 +93,7 @@ export function mapScriptResultToRun(result: ScriptRunResult): ScriptRunOutcome 
       exitCode: result.exitCode,
       error: `Script exited with code ${result.exitCode}`,
       skipReason: null,
-      terminalToken,
+      terminalToken: null,
     };
   }
   if (result.output.trim().length === 0) {
@@ -123,7 +122,7 @@ export function mapScriptResultToRun(result: ScriptRunResult): ScriptRunOutcome 
     exitCode: 0,
     error: null,
     skipReason: null,
-    terminalToken,
+    terminalToken: extractTerminalToken(result.output),
   };
 }
 

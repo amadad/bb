@@ -1,5 +1,5 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import { migrations } from "./data.js";
+import { migrations, repairRejectedTerminalTokenMigration } from "./data.js";
 import { ingestLegacyImport } from "./legacy-import.js";
 import { pluginDataDirFromDb } from "./path.js";
 import { automationRpcContract, createRpcHandlers } from "./rpc.js";
@@ -19,6 +19,7 @@ function resolveServerUrl(): string {
 export default async function plugin(bb: BbPluginApi) {
   const db = bb.storage.database();
   bb.storage.migrate(db, migrations);
+  repairRejectedTerminalTokenMigration(db);
   const pluginDataDir = pluginDataDirFromDb(db);
   await ingestLegacyImport({ bb, db, pluginDataDir });
 
