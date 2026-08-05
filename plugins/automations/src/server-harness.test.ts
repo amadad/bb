@@ -837,7 +837,7 @@ describe("automations server plugin harness", () => {
 
     await harness.emitThreadEvent("thread.idle", {
       thread: makeThreadResponse({ id: "thr_spawned", projectId: PROJECT_ID }),
-      lastAssistantText: null,
+      lastAssistantText: "PULSE_FAILED",
     });
     const closedRuns = automationRunListResponseSchema.parse(
       await harness.callRpc("automations_runs", {
@@ -848,7 +848,20 @@ describe("automations server plugin harness", () => {
     expect(closedRuns[0]).toMatchObject({
       status: "succeeded",
       threadId: "thr_spawned",
+      terminalToken: "PULSE_FAILED",
     });
+    const cliRuns = await harness.runCli([
+      "runs",
+      automation.id,
+      "--project",
+      PROJECT_ID,
+    ]);
+    expect(cliRuns.exitCode).toBe(0);
+    expect(cliRuns.stdout).toContain("Transport");
+    expect(cliRuns.stdout).toContain("Domain");
+    expect(cliRuns.stdout).toContain("transport=succeeded");
+    expect(cliRuns.stdout).toContain("domain=PULSE_FAILED");
+    expect(cliRuns.stdout).not.toContain("\nSucceeded");
     expect(signalKinds(host)).toEqual(
       expect.arrayContaining([
         "automations-changed",

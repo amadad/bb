@@ -38,6 +38,10 @@ import {
   getOneShotLifecycle,
   oneShotLifecycleAllowsToggle,
 } from "./lib/format-schedule";
+import {
+  formatRunDomainLabel,
+  formatRunTransportLabel,
+} from "./src/run-summary";
 
 export interface AutomationRunsViewState {
   runs: readonly AutomationRunResponse[];
@@ -190,22 +194,22 @@ export const AUTOMATION_RUN_STATUS_VISUALS: Record<
   }
 > = {
   running: {
-    label: "Running",
+    label: "transport=running",
     icon: "Loading",
     className: "animate-spin text-muted-foreground",
   },
   failed: {
-    label: "Failed",
+    label: "transport=failed",
     icon: "CircleX",
     className: "text-destructive",
   },
   skipped: {
-    label: "Skipped",
+    label: "transport=skipped",
     icon: null,
     className: "text-muted-foreground",
   },
   succeeded: {
-    label: "Succeeded",
+    label: "transport=succeeded",
     icon: "CircleCheck",
     className: "text-success",
   },
@@ -249,15 +253,22 @@ function RunRow({
 }) {
   const duration = formatRunDuration(run);
   const silent = isSilentRun(run);
+  const domainLabel = formatRunDomainLabel(run.terminalToken);
   const showOutput =
     run.runMode === "script" &&
     (run.output !== null || run.error !== null || silent);
   return (
     <div className="overflow-hidden rounded-sm">
       <div className="flex items-center gap-2 px-2 py-1.5 text-sm">
-        <span className="sr-only">
-          {AUTOMATION_RUN_STATUS_VISUALS[run.status].label}
+        <AutomationRunStatusIndicator status={run.status} />
+        <span className="font-medium">
+          {formatRunTransportLabel(run.status)}
         </span>
+        {domainLabel ? (
+          <span className="rounded-full bg-surface-recessed/70 px-2 py-0.5 font-mono text-xs text-muted-foreground">
+            {domainLabel}
+          </span>
+        ) : null}
         <span className="font-medium">
           {formatScheduleRunTime(run.startedAt)}
         </span>

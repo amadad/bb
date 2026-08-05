@@ -33,14 +33,15 @@ import {
   isWakeAgentSuppressed,
   mapScriptResultToRun,
 } from "./script-runner.js";
+import { extractTerminalToken } from "./terminal-token.js";
 import { sweepDueAutomations } from "./sweep.js";
 import { createAutomationService } from "./service.js";
 import { automationScriptDir } from "./script-files.js";
 import type { AgentEnvironment } from "./rpc-types.js";
 
-function createTestDb(): Db {
+function createTestDb(includeRunMigration = true): Db {
   const db = new Database(":memory:");
-  db.exec(migrations[0] ?? "");
+  db.exec(includeRunMigration ? migrations.join("\n") : migrations[0] ?? "");
   return db;
 }
 
@@ -154,7 +155,7 @@ function createAutomationServiceBb() {
 
 describe("data migrations", () => {
   it("migrates stored agent automations to current permission modes", () => {
-    const db = createTestDb();
+    const db = createTestDb(false);
     const insert = db.prepare(
       `INSERT INTO automations (
          id, project_id, name, enabled, trigger_type, trigger_config,
@@ -182,7 +183,7 @@ describe("data migrations", () => {
       );
     }
 
-    db.exec(migrations[1] ?? "");
+    db.exec(migrations.slice(1).join("\n"));
 
     const modes = db
       .prepare<[], { permissionMode: string }>(
@@ -438,6 +439,7 @@ describe("automation data access", () => {
       status: "skipped",
       skipReason: "empty output",
       exitCode: 0,
+      terminalToken: null,
       now: 1001,
     });
     const [closed] = listAutomationRuns(db, {
@@ -736,6 +738,12 @@ describe("script wake gate", () => {
     expect(isWakeAgentSuppressed("not json\n")).toBe(false);
   });
 
+  it("extracts a bare terminal token from the last non-empty line", () => {
+    expect(extractTerminalToken("hello\nPULSE_FAILED\n")).toBe("PULSE_FAILED");
+    expect(extractTerminalToken("hello\nPULSE FAILED\n")).toBeNull();
+    expect(extractTerminalToken(null)).toBeNull();
+  });
+
   it("maps silent successful scripts to skipped runs", () => {
     expect(
       mapScriptResultToRun({ exitCode: 0, output: "", timedOut: false }),
@@ -750,6 +758,13 @@ describe("script wake gate", () => {
     expect(
       mapScriptResultToRun({ exitCode: 2, output: "bad", timedOut: false }),
     ).toMatchObject({ status: "failed", error: "Script exited with code 2" });
+    expect(
+      mapScriptResultToRun({
+        exitCode: 0,
+        output: "done\nPULSE_FAILED\n",
+        timedOut: false,
+      }),
+    ).toMatchObject({ status: "succeeded", terminalToken: "PULSE_FAILED" });
   });
 });
 

@@ -146,6 +146,7 @@ function settleDispatchFailure(
       runId: args.run.id,
       status: "failed",
       error: message,
+      terminalToken: null,
       now: Date.now(),
     });
   } else {
@@ -229,6 +230,7 @@ function closeRunForUnusableTargetThread(
     runId: args.run.id,
     status: "failed",
     error: `Target thread ${args.targetThreadId} is unavailable: ${args.detail}`,
+    terminalToken: null,
     now,
   });
   bb.log.error(
@@ -255,6 +257,7 @@ export async function executeScriptRun(
         runId: args.run.id,
         status: "failed",
         error: "Script automation is missing a stored script file",
+        terminalToken: null,
         now: Date.now(),
       });
       return;
@@ -280,6 +283,7 @@ export async function executeScriptRun(
       output: mapped.output,
       exitCode: mapped.exitCode,
       error: mapped.error,
+      terminalToken: mapped.terminalToken,
       now: Date.now(),
     });
   } catch (error) {
@@ -298,15 +302,21 @@ export async function executeScriptRun(
 export function closeAutomationRunForSettledThread(
   bb: Pick<BbPluginApi, "realtime">,
   db: Db,
-  args: { threadId: string; status: "idle" | "failed"; error?: string | null },
+  args: {
+    threadId: string;
+    status: "succeeded" | "failed";
+    error?: string | null;
+    terminalToken?: string | null;
+  },
 ): void {
   const run = getRunningAutomationRunByThread(db, args.threadId);
   if (!run) return;
   const closed = closeAutomationRun(db, {
     runId: run.id,
-    status: args.status === "idle" ? "succeeded" : "failed",
-    error: args.status === "idle" ? null : (args.error ?? "Turn failed"),
+    status: args.status,
+    error: args.status === "succeeded" ? null : (args.error ?? "Turn failed"),
     threadId: args.threadId,
+    terminalToken: args.terminalToken ?? null,
     now: Date.now(),
   });
   if (!closed) return;
