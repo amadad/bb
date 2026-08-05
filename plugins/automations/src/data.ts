@@ -50,14 +50,14 @@ export interface AutomationRunRow {
   error: string | null;
   output: string | null;
   exitCode: number | null;
+  terminalToken: string | null;
   idempotencyKey: string | null;
   scheduledFor: number;
   startedAt: number;
   finishedAt: number | null;
 }
 
-interface RawAutomationRow
-  extends Omit<AutomationRow, "enabled"> {
+interface RawAutomationRow extends Omit<AutomationRow, "enabled"> {
   enabled: 0 | 1;
 }
 
@@ -163,7 +163,633 @@ export const migrations = [
        'workspace-write',
        'readonly'
      );`,
+  `ALTER TABLE automation_runs ADD COLUMN terminal_token TEXT;`,
 ];
+
+const AUTOMATIONS_STORAGE_MIGRATION_STATE_ERROR =
+  "Automations storage migration state is invalid; no changes were made.";
+
+interface TableColumn {
+  name: string;
+  type: string;
+  isNotNull: number;
+  defaultValue: string | null;
+  pk: number;
+  hidden: number;
+}
+
+interface ForeignKeyColumn {
+  id: number;
+  seq: number;
+  tableName: string;
+  fromColumn: string;
+  toColumn: string;
+  onDelete: string;
+  onUpdate: string;
+  match: string;
+}
+
+interface TableIndex {
+  name: string;
+  isUnique: number;
+  origin: string;
+  partial: number;
+}
+
+interface IndexColumn {
+  name: string | null;
+}
+
+interface ExpectedColumn {
+  name: string;
+  type: string;
+  isNotNull: number;
+  defaultValue: string | null;
+  pk: number;
+  hidden: number;
+}
+
+interface ExpectedIndex extends TableIndex {
+  columns: readonly string[];
+  sql: string | null;
+}
+
+interface SchemaObject {
+  type: string;
+  name: string;
+  tableName: string;
+  sql: string | null;
+}
+
+const migrationMarkerColumns: readonly ExpectedColumn[] = [
+  expectedColumn("id", "INTEGER", 0, null, 1),
+  expectedColumn("applied_at", "INTEGER", 1),
+];
+
+const migrationTableDdl = `CREATE TABLE _bb_migrations (
+  id INTEGER PRIMARY KEY,
+  applied_at INTEGER NOT NULL
+)`;
+
+const automationsTableDdl = `CREATE TABLE automations (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  target_thread_id TEXT,
+  name TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  trigger_type TEXT NOT NULL,
+  trigger_config TEXT NOT NULL,
+  run_mode TEXT NOT NULL,
+  execution TEXT NOT NULL,
+  auto_archive INTEGER NOT NULL DEFAULT 0,
+  origin TEXT NOT NULL,
+  created_by_thread_id TEXT,
+  next_run_at INTEGER,
+  last_run_at INTEGER,
+  run_count INTEGER NOT NULL DEFAULT 0,
+  last_run_status TEXT,
+  last_run_thread_id TEXT,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)`;
+
+const automationRunsBaseTableDdl = `CREATE TABLE automation_runs (
+  id TEXT PRIMARY KEY,
+  automation_id TEXT NOT NULL REFERENCES automations(id) ON DELETE CASCADE,
+  run_mode TEXT NOT NULL,
+  thread_id TEXT,
+  status TEXT NOT NULL,
+  trigger TEXT NOT NULL,
+  skip_reason TEXT,
+  error TEXT,
+  output TEXT,
+  exit_code INTEGER,
+  idempotency_key TEXT,
+  scheduled_for INTEGER NOT NULL,
+  started_at INTEGER NOT NULL,
+  finished_at INTEGER
+)`;
+
+const automationRunsFinalTableDdl = automationRunsBaseTableDdl.replace(
+  "finished_at INTEGER",
+  "finished_at INTEGER, terminal_token TEXT",
+);
+
+const automationThreadMarksTableDdl = `CREATE TABLE automation_thread_marks (
+  thread_id TEXT PRIMARY KEY,
+  automation_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+)`;
+
+const automationColumns: readonly ExpectedColumn[] = [
+  expectedColumn("id", "TEXT", 0, null, 1),
+  expectedColumn("project_id", "TEXT", 1),
+  expectedColumn("target_thread_id", "TEXT", 0),
+  expectedColumn("name", "TEXT", 1),
+  expectedColumn("enabled", "INTEGER", 1, "1"),
+  expectedColumn("trigger_type", "TEXT", 1),
+  expectedColumn("trigger_config", "TEXT", 1),
+  expectedColumn("run_mode", "TEXT", 1),
+  expectedColumn("execution", "TEXT", 1),
+  expectedColumn("auto_archive", "INTEGER", 1, "0"),
+  expectedColumn("origin", "TEXT", 1),
+  expectedColumn("created_by_thread_id", "TEXT", 0),
+  expectedColumn("next_run_at", "INTEGER", 0),
+  expectedColumn("last_run_at", "INTEGER", 0),
+  expectedColumn("run_count", "INTEGER", 1, "0"),
+  expectedColumn("last_run_status", "TEXT", 0),
+  expectedColumn("last_run_thread_id", "TEXT", 0),
+  expectedColumn("last_error", "TEXT", 0),
+  expectedColumn("created_at", "INTEGER", 1),
+  expectedColumn("updated_at", "INTEGER", 1),
+];
+
+const automationRunBaseColumns: readonly ExpectedColumn[] = [
+  expectedColumn("id", "TEXT", 0, null, 1),
+  expectedColumn("automation_id", "TEXT", 1),
+  expectedColumn("run_mode", "TEXT", 1),
+  expectedColumn("thread_id", "TEXT", 0),
+  expectedColumn("status", "TEXT", 1),
+  expectedColumn("trigger", "TEXT", 1),
+  expectedColumn("skip_reason", "TEXT", 0),
+  expectedColumn("error", "TEXT", 0),
+  expectedColumn("output", "TEXT", 0),
+  expectedColumn("exit_code", "INTEGER", 0),
+  expectedColumn("idempotency_key", "TEXT", 0),
+  expectedColumn("scheduled_for", "INTEGER", 1),
+  expectedColumn("started_at", "INTEGER", 1),
+  expectedColumn("finished_at", "INTEGER", 0),
+];
+
+const automationRunColumnsWithTerminalToken: readonly ExpectedColumn[] = [
+  ...automationRunBaseColumns,
+  expectedColumn("terminal_token", "TEXT", 0),
+];
+
+const automationThreadMarkColumns: readonly ExpectedColumn[] = [
+  expectedColumn("thread_id", "TEXT", 0, null, 1),
+  expectedColumn("automation_id", "TEXT", 1),
+  expectedColumn("run_id", "TEXT", 1),
+  expectedColumn("created_at", "INTEGER", 1),
+];
+
+const automationIndexes: readonly ExpectedIndex[] = [
+  expectedIndex(
+    "automations_project_idx",
+    ["project_id"],
+    0,
+    "c",
+    0,
+    "CREATE INDEX automations_project_idx ON automations(project_id)",
+  ),
+  expectedIndex(
+    "automations_due_idx",
+    ["enabled", "trigger_type", "next_run_at"],
+    0,
+    "c",
+    0,
+    "CREATE INDEX automations_due_idx ON automations(enabled, trigger_type, next_run_at)",
+  ),
+  expectedIndex(
+    "automations_target_thread_idx",
+    ["target_thread_id"],
+    0,
+    "c",
+    0,
+    "CREATE INDEX automations_target_thread_idx ON automations(target_thread_id)",
+  ),
+  expectedIndex("sqlite_autoindex_automations_1", ["id"], 1, "pk", 0, null),
+];
+
+const automationRunIndexes: readonly ExpectedIndex[] = [
+  expectedIndex(
+    "automation_runs_automation_started_idx",
+    ["automation_id", "started_at", "id"],
+    0,
+    "c",
+    0,
+    "CREATE INDEX automation_runs_automation_started_idx ON automation_runs(automation_id, started_at, id)",
+  ),
+  expectedIndex(
+    "automation_runs_thread_idx",
+    ["thread_id"],
+    0,
+    "c",
+    0,
+    "CREATE INDEX automation_runs_thread_idx ON automation_runs(thread_id)",
+  ),
+  expectedIndex(
+    "automation_runs_idempotency_idx",
+    ["automation_id", "idempotency_key"],
+    1,
+    "c",
+    1,
+    `CREATE UNIQUE INDEX automation_runs_idempotency_idx
+     ON automation_runs(automation_id, idempotency_key)
+     WHERE idempotency_key IS NOT NULL`,
+  ),
+  expectedIndex("sqlite_autoindex_automation_runs_1", ["id"], 1, "pk", 0, null),
+];
+
+const automationThreadMarkIndexes: readonly ExpectedIndex[] = [
+  expectedIndex(
+    "sqlite_autoindex_automation_thread_marks_1",
+    ["thread_id"],
+    1,
+    "pk",
+    0,
+    null,
+  ),
+];
+
+const automationRunForeignKeys: readonly ForeignKeyColumn[] = [
+  {
+    id: 0,
+    seq: 0,
+    tableName: "automations",
+    fromColumn: "automation_id",
+    toColumn: "id",
+    onDelete: "CASCADE",
+    onUpdate: "NO ACTION",
+    match: "NONE",
+  },
+];
+
+const migrationOnlySchemaObjects: readonly SchemaObject[] = [
+  expectedSchemaObject(
+    "table",
+    "_bb_migrations",
+    "_bb_migrations",
+    migrationTableDdl,
+  ),
+];
+
+const commonAutomationSchemaObjects: readonly SchemaObject[] = [
+  expectedSchemaObject(
+    "table",
+    "automations",
+    "automations",
+    automationsTableDdl,
+  ),
+  expectedSchemaObject(
+    "table",
+    "automation_thread_marks",
+    "automation_thread_marks",
+    automationThreadMarksTableDdl,
+  ),
+  ...expectedIndexSchemaObjects("automations", automationIndexes),
+  ...expectedIndexSchemaObjects("automation_runs", automationRunIndexes),
+  ...expectedIndexSchemaObjects(
+    "automation_thread_marks",
+    automationThreadMarkIndexes,
+  ),
+];
+
+const automationBaseSchemaObjects: readonly SchemaObject[] = [
+  ...migrationOnlySchemaObjects,
+  ...commonAutomationSchemaObjects,
+  expectedSchemaObject(
+    "table",
+    "automation_runs",
+    "automation_runs",
+    automationRunsBaseTableDdl,
+  ),
+];
+
+const automationFinalSchemaObjects: readonly SchemaObject[] = [
+  ...migrationOnlySchemaObjects,
+  ...commonAutomationSchemaObjects,
+  expectedSchemaObject(
+    "table",
+    "automation_runs",
+    "automation_runs",
+    automationRunsFinalTableDdl,
+  ),
+];
+
+function expectedColumn(
+  name: string,
+  type: string,
+  isNotNull: number,
+  defaultValue: string | null = null,
+  pk = 0,
+): ExpectedColumn {
+  return { name, type, isNotNull, defaultValue, pk, hidden: 0 };
+}
+
+function expectedIndex(
+  name: string,
+  columns: readonly string[],
+  isUnique: number,
+  origin: string,
+  partial: number,
+  sql: string | null,
+): ExpectedIndex {
+  return { name, columns, isUnique, origin, partial, sql };
+}
+
+function expectedSchemaObject(
+  type: string,
+  name: string,
+  tableName: string,
+  sql: string | null,
+): SchemaObject {
+  return { type, name, tableName, sql };
+}
+
+function expectedIndexSchemaObjects(
+  tableName: string,
+  indexes: readonly ExpectedIndex[],
+): SchemaObject[] {
+  return indexes.map((entry) =>
+    expectedSchemaObject("index", entry.name, tableName, entry.sql),
+  );
+}
+
+function tableExists(db: Db, tableName: string): boolean {
+  return (
+    db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(tableName) !== undefined
+  );
+}
+
+function tableColumns(db: Db, tableName: string): TableColumn[] {
+  return db
+    .prepare<[string], TableColumn>(
+      `SELECT
+         name, type, "notnull" AS isNotNull,
+         dflt_value AS defaultValue, pk, hidden
+       FROM pragma_table_xinfo(?)
+       ORDER BY cid`,
+    )
+    .all(tableName);
+}
+
+function hasExpectedColumns(
+  actual: readonly TableColumn[],
+  expected: readonly ExpectedColumn[],
+): boolean {
+  return (
+    actual.length === expected.length &&
+    actual.every((column, index) => {
+      const expectedColumn = expected[index];
+      return (
+        expectedColumn !== undefined &&
+        column.name === expectedColumn.name &&
+        column.type === expectedColumn.type &&
+        column.isNotNull === expectedColumn.isNotNull &&
+        column.defaultValue === expectedColumn.defaultValue &&
+        column.pk === expectedColumn.pk &&
+        column.hidden === expectedColumn.hidden
+      );
+    })
+  );
+}
+
+function normalizeSql(sql: string): string {
+  return sql
+    .replace(/--.*$/gm, "")
+    .trim()
+    .replace(/\s*([(),])\s*/g, "$1")
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
+function schemaObjects(db: Db): SchemaObject[] {
+  return db
+    .prepare<[], SchemaObject>(
+      `SELECT type, name, tbl_name AS tableName, sql
+       FROM sqlite_master`,
+    )
+    .all();
+}
+
+function hasExpectedSchemaObjects(
+  db: Db,
+  expected: readonly SchemaObject[],
+): boolean {
+  const actual = schemaObjects(db);
+  if (actual.length !== expected.length) return false;
+
+  const expectedByIdentity = new Map(
+    expected.map((entry) => [`${entry.type}:${entry.name}`, entry]),
+  );
+  return actual.every((entry) => {
+    const expectedEntry = expectedByIdentity.get(`${entry.type}:${entry.name}`);
+    if (
+      expectedEntry === undefined ||
+      entry.tableName !== expectedEntry.tableName
+    ) {
+      return false;
+    }
+    return expectedEntry.sql === null
+      ? entry.sql === null
+      : entry.sql !== null &&
+          normalizeSql(entry.sql) === normalizeSql(expectedEntry.sql);
+  });
+}
+
+function hasExpectedIndexes(
+  db: Db,
+  tableName: string,
+  expected: readonly ExpectedIndex[],
+): boolean {
+  const actual = db
+    .prepare<[string], TableIndex>(
+      `SELECT name, "unique" AS isUnique, origin, partial
+       FROM pragma_index_list(?)`,
+    )
+    .all(tableName);
+  if (actual.length !== expected.length) return false;
+
+  const actualByName = new Map(actual.map((entry) => [entry.name, entry]));
+  return expected.every((expectedEntry) => {
+    const actualEntry = actualByName.get(expectedEntry.name);
+    if (
+      actualEntry === undefined ||
+      actualEntry.isUnique !== expectedEntry.isUnique ||
+      actualEntry.origin !== expectedEntry.origin ||
+      actualEntry.partial !== expectedEntry.partial
+    ) {
+      return false;
+    }
+    const columns = db
+      .prepare<[string], IndexColumn>(
+        "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+      )
+      .all(expectedEntry.name)
+      .map((entry) => entry.name);
+    if (
+      columns.length !== expectedEntry.columns.length ||
+      columns.some((name, index) => name !== expectedEntry.columns[index])
+    ) {
+      return false;
+    }
+    const row = db
+      .prepare<
+        [string],
+        { sql: string | null }
+      >("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .get(expectedEntry.name);
+    if (row === undefined) return false;
+    return expectedEntry.sql === null
+      ? row.sql === null
+      : row.sql !== null &&
+          normalizeSql(row.sql) === normalizeSql(expectedEntry.sql);
+  });
+}
+
+function tableForeignKeys(db: Db, tableName: string): ForeignKeyColumn[] {
+  return db
+    .prepare<[string], ForeignKeyColumn>(
+      `SELECT id, seq,
+         "table" AS tableName,
+         "from" AS fromColumn,
+         "to" AS toColumn,
+         on_delete AS onDelete,
+         on_update AS onUpdate,
+         match
+       FROM pragma_foreign_key_list(?)
+       ORDER BY id, seq`,
+    )
+    .all(tableName);
+}
+
+function hasCompleteAutomationSchema(
+  db: Db,
+  expectedRunColumns: readonly ExpectedColumn[],
+  expectedSchemaObjects: readonly SchemaObject[],
+): boolean {
+  if (!hasExpectedSchemaObjects(db, expectedSchemaObjects)) return false;
+  if (
+    !hasExpectedColumns(tableColumns(db, "automations"), automationColumns) ||
+    !hasExpectedColumns(
+      tableColumns(db, "automation_runs"),
+      expectedRunColumns,
+    ) ||
+    !hasExpectedColumns(
+      tableColumns(db, "automation_thread_marks"),
+      automationThreadMarkColumns,
+    )
+  ) {
+    return false;
+  }
+  if (
+    tableForeignKeys(db, "automations").length !== 0 ||
+    tableForeignKeys(db, "automation_thread_marks").length !== 0
+  ) {
+    return false;
+  }
+  const runForeignKeys = tableForeignKeys(db, "automation_runs");
+  if (
+    runForeignKeys.length !== automationRunForeignKeys.length ||
+    runForeignKeys.some((foreignKey, index) => {
+      const expected = automationRunForeignKeys[index];
+      return (
+        expected === undefined ||
+        foreignKey.id !== expected.id ||
+        foreignKey.seq !== expected.seq ||
+        foreignKey.tableName !== expected.tableName ||
+        foreignKey.fromColumn !== expected.fromColumn ||
+        foreignKey.toColumn !== expected.toColumn ||
+        foreignKey.onDelete !== expected.onDelete ||
+        foreignKey.onUpdate !== expected.onUpdate ||
+        foreignKey.match !== expected.match
+      );
+    })
+  ) {
+    return false;
+  }
+  return (
+    hasExpectedIndexes(db, "automations", automationIndexes) &&
+    hasExpectedIndexes(db, "automation_runs", automationRunIndexes) &&
+    hasExpectedIndexes(
+      db,
+      "automation_thread_marks",
+      automationThreadMarkIndexes,
+    )
+  );
+}
+
+function storageMigrationStateError(): never {
+  throw new Error(AUTOMATIONS_STORAGE_MIGRATION_STATE_ERROR);
+}
+
+/**
+ * Reconcile the terminal-token schema and its array-index migration marker
+ * before the host applies migrations. Every accepted repair has a complete
+ * known schema and an exact known marker history. All other states fail before
+ * any write.
+ */
+export function reconcileTerminalTokenMigrationPreflight(db: Db): void {
+  db.transaction(() => {
+    const migrationTableExists = tableExists(db, "_bb_migrations");
+
+    if (!migrationTableExists) {
+      if (schemaObjects(db).length === 0) return;
+      storageMigrationStateError();
+    }
+    if (
+      !hasExpectedColumns(
+        tableColumns(db, "_bb_migrations"),
+        migrationMarkerColumns,
+      )
+    ) {
+      storageMigrationStateError();
+    }
+    const markerIds = db
+      .prepare<[], { id: number }>("SELECT id FROM _bb_migrations ORDER BY id")
+      .all()
+      .map((row) => row.id);
+    if (markerIds.length === 0) {
+      if (hasExpectedSchemaObjects(db, migrationOnlySchemaObjects)) return;
+      storageMigrationStateError();
+    }
+    const parentMarkers =
+      markerIds.length === 2 && markerIds[0] === 0 && markerIds[1] === 1;
+    const finalMarkers =
+      markerIds.length === 3 &&
+      markerIds[0] === 0 &&
+      markerIds[1] === 1 &&
+      markerIds[2] === 2;
+    if (!parentMarkers && !finalMarkers) storageMigrationStateError();
+
+    const baseSchema = hasCompleteAutomationSchema(
+      db,
+      automationRunBaseColumns,
+      automationBaseSchemaObjects,
+    );
+    const terminalTokenSchema = hasCompleteAutomationSchema(
+      db,
+      automationRunColumnsWithTerminalToken,
+      automationFinalSchemaObjects,
+    );
+    if (!baseSchema && !terminalTokenSchema) storageMigrationStateError();
+
+    if (finalMarkers) {
+      if (terminalTokenSchema) return;
+      db.exec("ALTER TABLE automation_runs ADD COLUMN terminal_token TEXT");
+      return;
+    }
+
+    if (terminalTokenSchema) {
+      db.prepare(
+        "INSERT INTO _bb_migrations (id, applied_at) VALUES (2, ?)",
+      ).run(Date.now());
+    }
+  })();
+}
+
+const automationRunSelectColumns = `
+  id, automation_id AS automationId, run_mode AS runMode,
+  thread_id AS threadId, status, trigger, skip_reason AS skipReason,
+  error, output, exit_code AS exitCode, terminal_token AS terminalToken,
+  idempotency_key AS idempotencyKey, scheduled_for AS scheduledFor,
+  started_at AS startedAt, finished_at AS finishedAt
+`;
 
 export interface CreateAutomationInput {
   id?: string;
@@ -194,11 +820,15 @@ function serializeExecution(execution: AutomationExecution): string {
   return JSON.stringify(execution);
 }
 
-export function parseAutomationTrigger(triggerConfig: string): AutomationTrigger {
+export function parseAutomationTrigger(
+  triggerConfig: string,
+): AutomationTrigger {
   return automationTriggerSchema.parse(JSON.parse(triggerConfig));
 }
 
-export function parseAutomationExecution(execution: string): AutomationExecution {
+export function parseAutomationExecution(
+  execution: string,
+): AutomationExecution {
   return automationExecutionSchema.parse(JSON.parse(execution));
 }
 
@@ -239,13 +869,17 @@ export function toAutomationRunResponse(
     error: row.error,
     output: row.output,
     exitCode: row.exitCode,
+    terminalToken: row.terminalToken,
     scheduledFor: row.scheduledFor,
     startedAt: row.startedAt,
     finishedAt: row.finishedAt,
   });
 }
 
-export function createAutomation(db: Db, input: CreateAutomationInput): AutomationRow {
+export function createAutomation(
+  db: Db,
+  input: CreateAutomationInput,
+): AutomationRow {
   const now = Date.now();
   const id = input.id ?? createAutomationId();
   db.prepare(
@@ -353,11 +987,16 @@ export function listAllAutomations(db: Db): AutomationRow[] {
 
 export function updateAutomation(
   db: Db,
-  args: { projectId: string; automationId: string; patch: UpdateAutomationInput },
+  args: {
+    projectId: string;
+    automationId: string;
+    patch: UpdateAutomationInput;
+  },
 ): AutomationRow | null {
   const existing = getAutomationForProject(db, args);
   if (!existing) return null;
-  const nextTrigger = args.patch.trigger ?? parseAutomationTrigger(existing.triggerConfig);
+  const nextTrigger =
+    args.patch.trigger ?? parseAutomationTrigger(existing.triggerConfig);
   const nextExecution =
     args.patch.execution ?? parseAutomationExecution(existing.execution);
   const now = Date.now();
@@ -387,7 +1026,9 @@ export function updateAutomation(
           ? (nextExecution.targetThreadId ?? null)
           : null,
     nextRunAt:
-      args.patch.nextRunAt !== undefined ? args.patch.nextRunAt : existing.nextRunAt,
+      args.patch.nextRunAt !== undefined
+        ? args.patch.nextRunAt
+        : existing.nextRunAt,
     now,
   });
   return getAutomationForProject(db, args);
@@ -526,11 +1167,11 @@ export function claimAutomationScheduledRun(
     db.prepare(
       `INSERT INTO automation_runs (
          id, automation_id, run_mode, thread_id, status, trigger, skip_reason,
-         error, output, exit_code, idempotency_key, scheduled_for, started_at,
-         finished_at
+         error, output, exit_code, terminal_token, idempotency_key,
+         scheduled_for, started_at, finished_at
        ) VALUES (
          @id, @automationId, @runMode, NULL, @status, 'schedule', @skipReason,
-         NULL, NULL, NULL, NULL, @scheduledFor, @startedAt, @finishedAt
+         NULL, NULL, NULL, NULL, NULL, @scheduledFor, @startedAt, @finishedAt
        )`,
     ).run({
       id: runId,
@@ -601,7 +1242,8 @@ export function restoreAutomationAfterFailedRun(
     }
     db.prepare(
       `UPDATE automation_runs
-       SET status = 'failed', error = @error, finished_at = @now
+       SET status = 'failed', error = @error, terminal_token = NULL,
+           finished_at = @now
        WHERE id = @runId`,
     ).run({ runId: args.runId, error: args.error, now: args.now });
   })();
@@ -617,33 +1259,43 @@ export function closeAutomationRun(
     output?: string | null;
     exitCode?: number | null;
     threadId?: string | null;
+    terminalToken?: string | null;
     now: number;
   },
 ): { run: AutomationRunRow; automationId: string } | null {
   return db.transaction(() => {
     const existing = getAutomationRun(db, args.runId);
     if (!existing) return null;
-    db.prepare(
-       `UPDATE automation_runs SET
-         status = @status,
-         skip_reason = @skipReason,
-         error = @error,
-         output = @output,
-         exit_code = @exitCode,
-         thread_id = CASE WHEN @hasThreadId THEN @threadId ELSE thread_id END,
-         finished_at = @now
-       WHERE id = @runId`,
-    ).run({
-      runId: args.runId,
-      status: args.status,
-      skipReason: args.skipReason ?? null,
-      error: args.error ?? null,
-      output: args.output ?? null,
-      exitCode: args.exitCode ?? null,
-      hasThreadId: args.threadId === undefined ? 0 : 1,
-      threadId: args.threadId ?? null,
-      now: args.now,
-    });
+    const run = optionalRunRow(
+      db
+        .prepare(
+          `UPDATE automation_runs SET
+             status = @status,
+             skip_reason = @skipReason,
+             error = @error,
+             output = @output,
+             exit_code = @exitCode,
+             terminal_token = @terminalToken,
+             thread_id = CASE WHEN @hasThreadId THEN @threadId ELSE thread_id END,
+             finished_at = @now
+           WHERE id = @runId AND status = 'running'
+           RETURNING ${automationRunSelectColumns}`,
+        )
+        .get({
+          runId: args.runId,
+          status: args.status,
+          skipReason: args.skipReason ?? null,
+          error: args.error ?? null,
+          output: args.output ?? null,
+          exitCode: args.exitCode ?? null,
+          terminalToken:
+            args.status === "succeeded" ? (args.terminalToken ?? null) : null,
+          hasThreadId: args.threadId === undefined ? 0 : 1,
+          threadId: args.threadId ?? null,
+          now: args.now,
+        }),
+    );
+    if (!run) return { run: existing, automationId: existing.automationId };
     db.prepare(
       `UPDATE automations SET
          last_run_status = @status,
@@ -661,8 +1313,6 @@ export function closeAutomationRun(
       error: args.error ?? null,
       now: args.now,
     });
-    const run = getAutomationRun(db, args.runId);
-    if (!run) return null;
     return { run, automationId: run.automationId };
   })();
 }
@@ -682,11 +1332,7 @@ export function createManualRun(
         db
           .prepare(
             `SELECT
-               id, automation_id AS automationId, run_mode AS runMode,
-               thread_id AS threadId, status, trigger, skip_reason AS skipReason,
-               error, output, exit_code AS exitCode,
-               idempotency_key AS idempotencyKey, scheduled_for AS scheduledFor,
-               started_at AS startedAt, finished_at AS finishedAt
+               ${automationRunSelectColumns}
              FROM automation_runs
              WHERE automation_id = ? AND idempotency_key = ?`,
           )
@@ -698,11 +1344,11 @@ export function createManualRun(
     db.prepare(
       `INSERT INTO automation_runs (
          id, automation_id, run_mode, thread_id, status, trigger, skip_reason,
-         error, output, exit_code, idempotency_key, scheduled_for, started_at,
-         finished_at
+         error, output, exit_code, terminal_token, idempotency_key,
+         scheduled_for, started_at, finished_at
        ) VALUES (
          @id, @automationId, @runMode, NULL, 'running', 'manual', NULL,
-         NULL, NULL, NULL, @idempotencyKey, @now, @now, NULL
+         NULL, NULL, NULL, NULL, @idempotencyKey, @now, @now, NULL
        )`,
     ).run({
       id: runId,
@@ -722,11 +1368,7 @@ export function getAutomationRun(db: Db, id: string): AutomationRunRow | null {
     db
       .prepare(
         `SELECT
-           id, automation_id AS automationId, run_mode AS runMode,
-           thread_id AS threadId, status, trigger, skip_reason AS skipReason,
-           error, output, exit_code AS exitCode,
-           idempotency_key AS idempotencyKey, scheduled_for AS scheduledFor,
-           started_at AS startedAt, finished_at AS finishedAt
+           ${automationRunSelectColumns}
          FROM automation_runs WHERE id = ?`,
       )
       .get(id),
@@ -763,9 +1405,7 @@ export function isAutomationSpawnedThread(db: Db, threadId: string): boolean {
       )
       .get(threadId) !== undefined ||
     db
-      .prepare(
-        `SELECT id FROM automation_runs WHERE thread_id = ? LIMIT 1`,
-      )
+      .prepare(`SELECT id FROM automation_runs WHERE thread_id = ? LIMIT 1`)
       .get(threadId) !== undefined
   );
 }
@@ -778,11 +1418,7 @@ export function getRunningAutomationRunByThread(
     db
       .prepare(
         `SELECT
-           id, automation_id AS automationId, run_mode AS runMode,
-           thread_id AS threadId, status, trigger, skip_reason AS skipReason,
-           error, output, exit_code AS exitCode,
-           idempotency_key AS idempotencyKey, scheduled_for AS scheduledFor,
-           started_at AS startedAt, finished_at AS finishedAt
+           ${automationRunSelectColumns}
          FROM automation_runs
          WHERE thread_id = ? AND status = 'running'
          ORDER BY started_at DESC
@@ -804,11 +1440,7 @@ export function listAutomationRuns(
     ? db
         .prepare(
           `SELECT
-             id, automation_id AS automationId, run_mode AS runMode,
-             thread_id AS threadId, status, trigger, skip_reason AS skipReason,
-             error, output, exit_code AS exitCode,
-             idempotency_key AS idempotencyKey, scheduled_for AS scheduledFor,
-             started_at AS startedAt, finished_at AS finishedAt
+             ${automationRunSelectColumns}
            FROM automation_runs
            WHERE automation_id = ?
              AND (started_at < ? OR (started_at = ? AND id < ?))
@@ -825,11 +1457,7 @@ export function listAutomationRuns(
     : db
         .prepare(
           `SELECT
-             id, automation_id AS automationId, run_mode AS runMode,
-             thread_id AS threadId, status, trigger, skip_reason AS skipReason,
-             error, output, exit_code AS exitCode,
-             idempotency_key AS idempotencyKey, scheduled_for AS scheduledFor,
-             started_at AS startedAt, finished_at AS finishedAt
+             ${automationRunSelectColumns}
            FROM automation_runs
            WHERE automation_id = ?
            ORDER BY started_at DESC, id DESC

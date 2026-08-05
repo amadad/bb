@@ -1,5 +1,8 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import { migrations } from "./data.js";
+import {
+  migrations,
+  reconcileTerminalTokenMigrationPreflight,
+} from "./data.js";
 import { ingestLegacyImport } from "./legacy-import.js";
 import { pluginDataDirFromDb } from "./path.js";
 import { automationRpcContract, createRpcHandlers } from "./rpc.js";
@@ -10,6 +13,7 @@ import {
 import { registerAutomationCli } from "./cli.js";
 import { createAutomationService } from "./service.js";
 import { sleep, sweepDueAutomations, SWEEP_INTERVAL_MS } from "./sweep.js";
+import { extractTerminalToken } from "./terminal-token.js";
 
 function resolveServerUrl(): string {
   return process.env.BB_SERVER_URL?.trim() || "http://127.0.0.1:38886";
@@ -17,6 +21,7 @@ function resolveServerUrl(): string {
 
 export default async function plugin(bb: BbPluginApi) {
   const db = bb.storage.database();
+  reconcileTerminalTokenMigrationPreflight(db);
   bb.storage.migrate(db, migrations);
   const pluginDataDir = pluginDataDirFromDb(db);
   await ingestLegacyImport({ bb, db, pluginDataDir });
@@ -31,10 +36,11 @@ export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(automationRpcContract, createRpcHandlers(service));
   registerAutomationCli({ bb, service });
 
-  bb.events.on("thread.idle", ({ thread }) => {
+  bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
     closeAutomationRunForSettledThread(bb, db, {
       threadId: thread.id,
-      status: "idle",
+      status: "succeeded",
+      terminalToken: extractTerminalToken(lastAssistantText),
     });
   });
   bb.events.on("thread.failed", ({ thread, error }) => {
