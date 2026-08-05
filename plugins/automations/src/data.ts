@@ -167,29 +167,225 @@ export const migrations = [
   `ALTER TABLE automation_runs ADD COLUMN terminal_token TEXT;`,
 ];
 
-/**
- * Repair only databases that ran the rejected migration ordering. The host
- * records migration completion by array index. Such a database has index 2
- * recorded (the old permission-mode update) but lacks terminal_token because
- * the rejected ALTER was inserted at already-recorded index 1.
- */
-export function repairRejectedTerminalTokenMigration(db: Db): boolean {
-  const rejectedIndexApplied =
-    db
-      .prepare("SELECT 1 FROM _bb_migrations WHERE id = 2")
-      .get() !== undefined;
-  if (!rejectedIndexApplied) return false;
+const AUTOMATIONS_STORAGE_MIGRATION_STATE_ERROR =
+  "Automations storage migration state is invalid; no changes were made.";
 
-  const terminalTokenExists =
+interface TableColumn {
+  name: string;
+  type: string;
+  isNotNull: number;
+  pk: number;
+}
+
+interface ForeignKeyColumn {
+  tableName: string;
+  fromColumn: string;
+  toColumn: string;
+  onDelete: string;
+  onUpdate: string;
+}
+
+interface ExpectedColumn {
+  name: string;
+  type: string;
+  isNotNull: number;
+  pk: number;
+}
+
+const migrationMarkerColumns: readonly ExpectedColumn[] = [
+  { name: "id", type: "INTEGER", isNotNull: 0, pk: 1 },
+  { name: "applied_at", type: "INTEGER", isNotNull: 1, pk: 0 },
+];
+
+const automationRunBaseColumns: readonly ExpectedColumn[] = [
+  { name: "id", type: "TEXT", isNotNull: 0, pk: 1 },
+  { name: "automation_id", type: "TEXT", isNotNull: 1, pk: 0 },
+  { name: "run_mode", type: "TEXT", isNotNull: 1, pk: 0 },
+  { name: "thread_id", type: "TEXT", isNotNull: 0, pk: 0 },
+  { name: "status", type: "TEXT", isNotNull: 1, pk: 0 },
+  { name: "trigger", type: "TEXT", isNotNull: 1, pk: 0 },
+  { name: "skip_reason", type: "TEXT", isNotNull: 0, pk: 0 },
+  { name: "error", type: "TEXT", isNotNull: 0, pk: 0 },
+  { name: "output", type: "TEXT", isNotNull: 0, pk: 0 },
+  { name: "exit_code", type: "INTEGER", isNotNull: 0, pk: 0 },
+  { name: "idempotency_key", type: "TEXT", isNotNull: 0, pk: 0 },
+  { name: "scheduled_for", type: "INTEGER", isNotNull: 1, pk: 0 },
+  { name: "started_at", type: "INTEGER", isNotNull: 1, pk: 0 },
+  { name: "finished_at", type: "INTEGER", isNotNull: 0, pk: 0 },
+];
+
+const automationRunColumnsWithTerminalToken: readonly ExpectedColumn[] = [
+  ...automationRunBaseColumns,
+  { name: "terminal_token", type: "TEXT", isNotNull: 0, pk: 0 },
+];
+
+function schemaObjectExists(db: Db, name: string): boolean {
+  return (
     db
-      .prepare(
-        "SELECT 1 FROM pragma_table_info('automation_runs') WHERE name = 'terminal_token'",
+      .prepare("SELECT 1 FROM sqlite_master WHERE name = ?")
+      .get(name) !== undefined
+  );
+}
+
+function tableExists(db: Db, tableName: string): boolean {
+  return (
+    db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(tableName) !== undefined
+  );
+}
+
+function tableColumns(db: Db, tableName: string): TableColumn[] {
+  return db
+    .prepare<[string], TableColumn>(
+      'SELECT name, type, "notnull" AS isNotNull, pk FROM pragma_table_info(?)',
+    )
+    .all(tableName);
+}
+
+function hasExpectedColumns(
+  actual: readonly TableColumn[],
+  expected: readonly ExpectedColumn[],
+): boolean {
+  return (
+    actual.length === expected.length &&
+    actual.every((column, index) => {
+      const expectedColumn = expected[index];
+      return (
+        expectedColumn !== undefined &&
+        column.name === expectedColumn.name &&
+        column.type === expectedColumn.type &&
+        column.isNotNull === expectedColumn.isNotNull &&
+        column.pk === expectedColumn.pk
+      );
+    })
+  );
+}
+
+function hasCompleteAutomationRunsSchema(
+  db: Db,
+  expectedColumns: readonly ExpectedColumn[],
+): boolean {
+  if (!hasExpectedColumns(tableColumns(db, "automation_runs"), expectedColumns)) {
+    return false;
+  }
+  const foreignKeys = db
+    .prepare<[], ForeignKeyColumn>(
+      `SELECT
+         "table" AS tableName,
+         "from" AS fromColumn,
+         "to" AS toColumn,
+         on_delete AS onDelete,
+         on_update AS onUpdate
+       FROM pragma_foreign_key_list('automation_runs')`,
+    )
+    .all();
+  if (
+    foreignKeys.length !== 1 ||
+    foreignKeys[0]?.tableName !== "automations" ||
+    foreignKeys[0]?.fromColumn !== "automation_id" ||
+    foreignKeys[0]?.toColumn !== "id" ||
+    foreignKeys[0]?.onDelete !== "CASCADE" ||
+    foreignKeys[0]?.onUpdate !== "NO ACTION"
+  ) {
+    return false;
+  }
+  const indexes = new Set(
+    db
+      .prepare<[string], { name: string }>(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?",
       )
-      .get() !== undefined;
-  if (terminalTokenExists) return false;
+      .all("automation_runs")
+      .map((index) => index.name),
+  );
+  return (
+    indexes.has("automation_runs_automation_started_idx") &&
+    indexes.has("automation_runs_thread_idx") &&
+    indexes.has("automation_runs_idempotency_idx")
+  );
+}
 
-  db.exec("ALTER TABLE automation_runs ADD COLUMN terminal_token TEXT");
-  return true;
+function hasExpectedMigrationMarkers(markerIds: readonly number[]): boolean {
+  return markerIds.length <= 3 && markerIds.every((id, index) => id === index);
+}
+
+function storageMigrationStateError(): never {
+  throw new Error(AUTOMATIONS_STORAGE_MIGRATION_STATE_ERROR);
+}
+
+/**
+ * Reconcile the terminal-token schema and its array-index migration marker
+ * before the host applies migrations. Every accepted repair has a complete
+ * known schema and an exact known marker history; all other states fail before
+ * any write.
+ */
+export function reconcileTerminalTokenMigrationPreflight(db: Db): void {
+  db.transaction(() => {
+    const migrationTableExists = tableExists(db, "_bb_migrations");
+    const migrationObjectExists = schemaObjectExists(db, "_bb_migrations");
+    const automationRunsExists = tableExists(db, "automation_runs");
+    const automationRunsObjectExists = schemaObjectExists(
+      db,
+      "automation_runs",
+    );
+    const automationTablesExist =
+      db
+        .prepare(
+          `SELECT 1 FROM sqlite_master
+           WHERE type IN ('table', 'view')
+             AND name IN ('automations', 'automation_runs', 'automation_thread_marks')`,
+        )
+        .get() !== undefined;
+
+    if (!migrationTableExists) {
+      if (!migrationObjectExists && !automationTablesExist) return;
+      storageMigrationStateError();
+    }
+    if (!hasExpectedColumns(tableColumns(db, "_bb_migrations"), migrationMarkerColumns)) {
+      storageMigrationStateError();
+    }
+    const markerIds = db
+      .prepare<[], { id: number }>("SELECT id FROM _bb_migrations ORDER BY id")
+      .all()
+      .map((row) => row.id);
+    if (!hasExpectedMigrationMarkers(markerIds)) {
+      storageMigrationStateError();
+    }
+    if (markerIds.length === 0 && !automationTablesExist) return;
+    if (
+      !automationRunsExists ||
+      !automationRunsObjectExists ||
+      !tableExists(db, "automations") ||
+      !tableExists(db, "automation_thread_marks")
+    ) {
+      storageMigrationStateError();
+    }
+
+    const baseSchema = hasCompleteAutomationRunsSchema(
+      db,
+      automationRunBaseColumns,
+    );
+    const terminalTokenSchema = hasCompleteAutomationRunsSchema(
+      db,
+      automationRunColumnsWithTerminalToken,
+    );
+    if (!baseSchema && !terminalTokenSchema) storageMigrationStateError();
+
+    const terminalMigrationApplied = markerIds.length === 3;
+    if (terminalMigrationApplied) {
+      if (terminalTokenSchema) return;
+      db.exec("ALTER TABLE automation_runs ADD COLUMN terminal_token TEXT");
+      return;
+    }
+
+    const parentMigrationsApplied = markerIds.length === 2;
+    if (terminalTokenSchema) {
+      if (!parentMigrationsApplied) storageMigrationStateError();
+      db.prepare(
+        "INSERT INTO _bb_migrations (id, applied_at) VALUES (2, ?)",
+      ).run(Date.now());
+    }
+  })();
 }
 
 const automationRunSelectColumns = `

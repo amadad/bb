@@ -20,7 +20,7 @@ import {
   listAutomationsForProject,
   listAutomationRuns,
   migrations,
-  repairRejectedTerminalTokenMigration,
+  reconcileTerminalTokenMigrationPreflight,
   restoreAutomationAfterFailedRun,
   type Db,
 } from "./data.js";
@@ -66,6 +66,22 @@ function migrateByIndex(db: Db, statements: readonly string[]): void {
       record.run(index, 1);
     });
   })();
+}
+
+function automationRunColumns(db: Db): string[] {
+  return db
+    .prepare<[], { name: string }>(
+      "SELECT name FROM pragma_table_info('automation_runs')",
+    )
+    .all()
+    .map((row) => row.name);
+}
+
+function migrationIds(db: Db): number[] {
+  return db
+    .prepare<[], { id: number }>("SELECT id FROM _bb_migrations ORDER BY id")
+    .all()
+    .map((row) => row.id);
 }
 
 function createScheduledAutomation(
@@ -177,28 +193,23 @@ function createAutomationServiceBb() {
 }
 
 describe("data migrations", () => {
-  it("applies terminal_token on a fresh database at migration index 2", () => {
+  it("leaves a fresh database untouched before migration index 2 is applied", () => {
     const db = new Database(":memory:");
-    migrateByIndex(db, migrations);
-
-    const columns = db
-      .prepare<[], { name: string }>(
-        "SELECT name FROM pragma_table_info('automation_runs')",
-      )
-      .all()
-      .map((row) => row.name);
-    expect(columns).toContain("terminal_token");
+    reconcileTerminalTokenMigrationPreflight(db);
     expect(
       db
-        .prepare<[], { id: number }>(
-          "SELECT id FROM _bb_migrations ORDER BY id",
+        .prepare<[], { name: string }>(
+          "SELECT name FROM sqlite_master WHERE type = 'table'",
         )
         .all(),
-    ).toEqual([{ id: 0 }, { id: 1 }, { id: 2 }]);
-    expect(repairRejectedTerminalTokenMigration(db)).toBe(false);
+    ).toEqual([]);
+
+    migrateByIndex(db, migrations);
+    expect(automationRunColumns(db)).toContain("terminal_token");
+    expect(migrationIds(db)).toEqual([0, 1, 2]);
   });
 
-  it("repairs the exact parent-to-rejected upgrade without changing migration ids", () => {
+  it("repairs the exact parent-to-rejected upgrade before migration runs", () => {
     const db = new Database(":memory:");
     const parentMigrations = migrations.slice(0, 2);
     const rejectedMigrations = [
@@ -209,33 +220,90 @@ describe("data migrations", () => {
 
     migrateByIndex(db, parentMigrations);
     migrateByIndex(db, rejectedMigrations);
-    expect(
-      db
-        .prepare<[], { name: string }>(
-          "SELECT name FROM pragma_table_info('automation_runs')",
-        )
-        .all()
-        .map((row) => row.name),
-    ).not.toContain("terminal_token");
+    expect(automationRunColumns(db)).not.toContain("terminal_token");
 
+    reconcileTerminalTokenMigrationPreflight(db);
     migrateByIndex(db, migrations);
-    expect(repairRejectedTerminalTokenMigration(db)).toBe(true);
-    expect(
-      db
-        .prepare<[], { name: string }>(
-          "SELECT name FROM pragma_table_info('automation_runs')",
-        )
-        .all()
-        .map((row) => row.name),
-    ).toContain("terminal_token");
-    expect(
-      db
-        .prepare<[], { id: number }>(
-          "SELECT id FROM _bb_migrations ORDER BY id",
-        )
-        .all(),
-    ).toEqual([{ id: 0 }, { id: 1 }, { id: 2 }]);
-    expect(repairRejectedTerminalTokenMigration(db)).toBe(false);
+    expect(automationRunColumns(db)).toContain("terminal_token");
+    expect(migrationIds(db)).toEqual([0, 1, 2]);
+  });
+
+  it("leaves a normal upgraded database unchanged", () => {
+    const db = new Database(":memory:");
+    migrateByIndex(db, migrations);
+    const before = {
+      columns: automationRunColumns(db),
+      markerIds: migrationIds(db),
+    };
+
+    reconcileTerminalTokenMigrationPreflight(db);
+
+    expect({
+      columns: automationRunColumns(db),
+      markerIds: migrationIds(db),
+    }).toEqual(before);
+  });
+
+  it("fails closed for id 2 paired with a partial or unrelated run schema", () => {
+    const db = new Database(":memory:");
+    db.exec(`CREATE TABLE _bb_migrations (
+      id INTEGER PRIMARY KEY,
+      applied_at INTEGER NOT NULL
+    );
+    INSERT INTO _bb_migrations (id, applied_at) VALUES (0, 1), (1, 1), (2, 1);
+    CREATE TABLE automation_runs (id TEXT PRIMARY KEY);`);
+
+    expect(() => reconcileTerminalTokenMigrationPreflight(db)).toThrow(
+      "Automations storage migration state is invalid; no changes were made.",
+    );
+    expect(automationRunColumns(db)).toEqual(["id"]);
+    expect(migrationIds(db)).toEqual([0, 1, 2]);
+  });
+
+  it("fails closed when a migration marker has no automation_runs table", () => {
+    const db = new Database(":memory:");
+    db.exec(`CREATE TABLE _bb_migrations (
+      id INTEGER PRIMARY KEY,
+      applied_at INTEGER NOT NULL
+    );
+    INSERT INTO _bb_migrations (id, applied_at) VALUES (0, 1), (1, 1), (2, 1);`);
+
+    expect(() => reconcileTerminalTokenMigrationPreflight(db)).toThrow(
+      "Automations storage migration state is invalid; no changes were made.",
+    );
+    expect(migrationIds(db)).toEqual([0, 1, 2]);
+  });
+
+  it("reconciles a valid terminal_token column with its missing marker", () => {
+    const db = new Database(":memory:");
+    migrateByIndex(db, migrations.slice(0, 2));
+    db.exec("ALTER TABLE automation_runs ADD COLUMN terminal_token TEXT");
+
+    reconcileTerminalTokenMigrationPreflight(db);
+    migrateByIndex(db, migrations);
+
+    expect(automationRunColumns(db).filter((name) => name === "terminal_token")).toEqual([
+      "terminal_token",
+    ]);
+    expect(migrationIds(db)).toEqual([0, 1, 2]);
+  });
+
+  it("is idempotent across duplicate rejected-upgrade startup", () => {
+    const db = new Database(":memory:");
+    migrateByIndex(db, migrations.slice(0, 2));
+    migrateByIndex(db, [migrations[0]!, migrations[2]!, migrations[1]!]);
+
+    reconcileTerminalTokenMigrationPreflight(db);
+    const afterFirstPreflight = {
+      columns: automationRunColumns(db),
+      markerIds: migrationIds(db),
+    };
+    reconcileTerminalTokenMigrationPreflight(db);
+
+    expect({
+      columns: automationRunColumns(db),
+      markerIds: migrationIds(db),
+    }).toEqual(afterFirstPreflight);
   });
 
   it("migrates stored agent automations to current permission modes", () => {
