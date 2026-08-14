@@ -97,7 +97,7 @@ node scripts/bump-version.mjs <new-version>
 Then commit and ship through the normal `sawyer-next` → `main` flow. You can also
 use `--patch`, `--minor`, or `--major` instead of an explicit version.
 
-CI enforces this lockstep. Direct edits that leave
+Local release validation enforces this lockstep. Direct edits that leave
 `packages/bb-app/package.json` and `apps/desktop/package.json` with different
 versions fail the build. Never edit either package version directly for a
 release; use `scripts/bump-version.mjs` so both files move together.
@@ -107,15 +107,8 @@ immutable releases and `desktop-latest` for the moving pointer.
 
 ## Nightly channel
 
-The scheduled `publish-bb-app.yml` workflow runs from `main` every day at
-3:00 AM Pacific (`America/Los_Angeles`, including daylight-saving changes). It
-derives a unique version such as `0.34.1-nightly.<run-id>.<attempt>` without
-committing that version, publishes `bb-app` with the npm `nightly` dist-tag,
-and builds the desktop app from that same lockstep version.
-
-To publish or dry-run the channel manually from `main`, dispatch the same
-workflow with `npm_tag=nightly`. A non-dry run publishes both npm and desktop;
-a dry run validates only the npm package path.
+This fork does not run an automated nightly channel. Create and publish a
+nightly build only as part of an explicitly approved manual release.
 
 The nightly desktop is a separate installation:
 
@@ -149,7 +142,7 @@ identity, yellow icon, and update URLs. Omit the variable (or set it to
 The desktop package is ready for Developer ID signing and Apple notarization.
 Local builds with no secrets sign via keychain auto-discovery and skip
 notarization. To activate signed and notarized release artifacts, add these
-GitHub Actions secrets:
+Manual signing and notarization secrets:
 
 | Secret                       | Value                                                                                                                                                                                  |
 | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -160,13 +153,12 @@ GitHub Actions secrets:
 | `APPLE_APP_PASSWORD`         | App-specific password from `appleid.apple.com` under Sign-In and Security.                                                                                                             |
 | `APPLE_TEAM_ID`              | Developer Team ID from `developer.apple.com/account` membership details.                                                                                                               |
 
-Once those secrets are present, the next `Build Desktop` workflow run with
-`publish=true` and `release_channel=stable` signs the `.app`, notarizes it, and
-publishes the signed `.dmg` / `.zip` assets to `desktop-latest`. If no required
-signing secrets are configured, the workflow still builds unsigned artifacts, but
-the release job publishes only `desktop-version.json` and withholds unsigned
-binaries from `desktop-latest`. If only some required signing secrets are set,
-the workflow fails before packaging so a misconfigured release cannot silently
+Once those secrets are available, a manually operated release can sign the
+`.app`, notarize it, and publish the signed `.dmg` / `.zip` assets to
+`desktop-latest`. If no required signing secrets are configured, a local build
+still produces unsigned artifacts, but
+only `desktop-version.json` should be published. If only some required signing
+secrets are set, stop before packaging so a misconfigured release cannot silently
 produce unsigned or signed-but-not-notarized artifacts.
 
 ## Auto-update

@@ -139,19 +139,13 @@ rebuild the native dependency, for example `npm rebuild better-sqlite3`.
 - Native Windows checkouts are outside the support contract unless we later
   choose to support a native Windows product path.
 
-## CI And Validation
+## Local Validation
 
-- GitHub Actions uses Ubuntu as the required support gate for build,
-  typecheck, lint, test, and Linux smoke coverage.
-- Full build, typecheck, lint, and test checks run on Ubuntu with Node.js 22
-  only.
-- Pull requests run the `bb-app` tarball smoke on Ubuntu and macOS with Node.js
-  22, validating the packed npm artifact through `npx --package`.
-- Pushes to `main` and manually dispatched CI runs also run the `bb-app` tarball
-  smoke on Ubuntu and macOS with Node.js 24 and 26.
-- Branch protection should require `Checks (ubuntu-latest, Node 22.x)`,
-  `Package Smoke (ubuntu-latest, Node 22.x)`, and
-  `Package Smoke (macos-latest, Node 22.x)`. The Node.js 24 and 26 compatibility
+- This fork does not use GitHub Actions as a support or release gate.
+- Run build, typecheck, lint, test, and package smoke checks locally before an
+  approved release.
+- Keep the validation environment explicit in the release record, including
+  operating system and Node.js version.
   smoke jobs do not run on pull requests and should not be configured as
   required PR checks.
 - Native Windows CI is intentionally not required because Windows support uses
